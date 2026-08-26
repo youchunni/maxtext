@@ -21,7 +21,7 @@ import os
 import re
 from typing import Optional
 
-from flax import nnx, linen as nn
+from flax import nnx
 from flax.linen import partitioning as nn_partitioning
 from flax.training import train_state
 import jax
@@ -168,8 +168,16 @@ def load_adapter(config, base_abstract_state_params, adapter_config_path, adapte
     if lora_config is None:
       raise FileNotFoundError(f"Failed to read lora_config from {adapter_config_path}.")
 
-    if not gcs_utils.gcs_path_exists(f"{adapter_weights_path}/commit_success.txt"):
-      raise FileNotFoundError(f"Failed to read lora_weights from {adapter_weights_path}.")
+    if adapter_weights_path.startswith("gs://"):
+      if not gcs_utils.gcs_path_exists(f"{adapter_weights_path}/commit_success.txt"):
+        raise FileNotFoundError(f"Failed to read lora_weights from {adapter_weights_path}.")
+    else:
+      if not (
+          os.path.exists(f"{adapter_weights_path}/commit_success.txt")
+          or os.path.exists(f"{adapter_weights_path}/_CHECKPOINT_METADATA")
+          or os.path.isdir(adapter_weights_path)
+      ):
+        raise FileNotFoundError(f"Failed to read lora_weights from {adapter_weights_path}.")
 
     if config.pure_nnx:
       lora_state, _ = get_lora_abstract_state_nnx(base_abstract_state_params, lora_config)
@@ -640,47 +648,18 @@ def apply_lora_to_model(
       del val.qwix_rngs
 
   if mesh is not None:
-    with jax.set_mesh(mesh), nn_partitioning.axis_rules(mt_config.logical_axis_rules):
-      graph_def, state = nnx.split(lora_model)
-
-      # We handle explicit replication for LoRA to ensure safety and efficiency.
-      state = jax.tree_util.tree_map(
-          lambda x: x.replace(sharding=jax.sharding.PartitionSpec(), out_sharding=None, sharding_names=None)
-          if isinstance(x, nnx.LoRAParam)
-          else x,
-          state,
-          is_leaf=lambda x: isinstance(x, nnx.Variable),
-      )
-
-      # Use logical_to_mesh_sharding to correctly map logical axes like 'embed'
-      # to physical mesh axes.
-      dst_shardings = nn.logical_to_mesh_sharding(nnx.get_partition_spec(state), mesh, mt_config.logical_axis_rules)
-
-      def _safe_reshard(var, sharding_spec):
-        if not isinstance(var, nnx.Variable) or not isinstance(sharding_spec, jax.sharding.Sharding):
-          return var
-        val = var.get_value()
-        if not isinstance(val, jax.Array):
-          return var
-        if hasattr(sharding_spec, "spec") and len(sharding_spec.spec) != val.ndim:
-          spec_tuple = tuple(sharding_spec.spec)
-          if len(spec_tuple) > val.ndim:
-            if "local_layers" in spec_tuple and len(spec_tuple) - 1 == val.ndim:
-              spec_tuple = tuple(axis for axis in spec_tuple if axis != "local_layers")
-            else:
-              spec_tuple = spec_tuple[: val.ndim]
-          elif len(spec_tuple) < val.ndim:
-            spec_tuple = spec_tuple + (None,) * (val.ndim - len(spec_tuple))
-          sharding_spec = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(*spec_tuple))
-        # make_array_from_callback natively constructs a globally sharded array
-        # from the local host arrays, bypassing backend-specific device_put issues
-        # on both Pathways and McJAX.
-        resharded_val = jax.make_array_from_callback(val.shape, sharding_spec, lambda idx: val[idx])
-        return var.replace(value=resharded_val)
-
-      state = jax.tree_util.tree_map(_safe_reshard, state, dst_shardings, is_leaf=lambda x: isinstance(x, nnx.Variable))
-
-      lora_model = nnx.merge(graph_def, state)
+    replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    for _, var in nnx.iter_graph(lora_model):
+      if isinstance(var, nnx.LoRAParam):
+        if hasattr(var, "set_metadata"):
+          var.set_metadata(sharding=jax.sharding.PartitionSpec(), out_sharding=None, sharding_names=None)
+        val = var.get_value() if hasattr(var, "get_value") else getattr(var, "value", None)
+        if isinstance(val, jax.Array) and val.sharding != replicated_sharding:
+          resharded_val = jax.make_array_from_callback(val.shape, replicated_sharding, lambda idx, v=val: v[idx])
+          if hasattr(var, "set_value"):
+            var.set_value(resharded_val)
+          else:
+            var.value = resharded_val
 
   _verify_lora_parameters(lora_model, mt_config)  # pyrefly: ignore[bad-argument-type]
 
@@ -727,7 +706,7 @@ def restore_lora_from_path(model: nnx.Module, mt_config: pyconfig.HyperParameter
   abstract_lora_params = nnx.state(model, nnx.LoRAParam)
 
   def _build_target_leaf(v):
-    val = getattr(v, "value", v)
+    val = v.get_value() if hasattr(v, "get_value") else getattr(v, "value", v)
     pspec = getattr(v, "sharding", None)
     if not isinstance(pspec, jax.sharding.PartitionSpec):
       pspec = jax.sharding.PartitionSpec()
@@ -781,26 +760,37 @@ def restore_lora_from_path(model: nnx.Module, mt_config: pyconfig.HyperParameter
 
     if isinstance(curr, dict) and "value" in curr:
       matched_val = curr["value"]
+    elif hasattr(curr, "get_value"):
+      matched_val = curr.get_value()
     elif hasattr(curr, "value"):
       matched_val = getattr(curr, "value")
     else:
       matched_val = curr
 
     target_sharding = getattr(variable, "sharding", None)
-    if target_sharding is None:
+    if not isinstance(target_sharding, jax.sharding.Sharding):
       try:
-        mesh = maxtext_utils.get_mesh_from_config(mt_config)
+        mesh = getattr(model, "mesh", None) or maxtext_utils.get_mesh_from_config(mt_config)
         if mesh:
-          target_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+          if isinstance(target_sharding, jax.sharding.PartitionSpec):
+            pspec = target_sharding
+          else:
+            pspec = jax.sharding.PartitionSpec()
+          target_sharding = jax.sharding.NamedSharding(mesh, pspec)
+        else:
+          target_sharding = None
       except Exception:  # pylint: disable=broad-exception-caught
-        pass
+        target_sharding = None
 
     if target_sharding is not None:
       try:
         matched_val = jax.device_put(matched_val, target_sharding)
       except Exception:  # pylint: disable=broad-exception-caught
         pass
-    variable.value = matched_val
+    if hasattr(variable, "set_value"):
+      variable.set_value(matched_val)
+    else:
+      variable.value = matched_val
 
   jax.tree_util.tree_map_with_path(
       _map_to_state,
