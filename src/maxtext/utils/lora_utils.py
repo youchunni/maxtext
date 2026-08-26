@@ -161,18 +161,15 @@ def load_adapter(config, base_abstract_state_params, adapter_config_path, adapte
   if adapter_config_path:
     if adapter_config_path.startswith("gs://"):
       lora_config = gcs_utils.read_json_from_gcs(adapter_config_path)
+      commit_success = gcs_utils.gcs_path_exists(f"{adapter_weights_path}/commit_success.txt")
     else:
       with open(adapter_config_path, "rt", encoding="utf8") as f:
         lora_config = json.load(f)
+      commit_success = os.path.exists(f"{adapter_weights_path}/commit_success.txt")
 
     if lora_config is None:
       raise FileNotFoundError(f"Failed to read lora_config from {adapter_config_path}.")
 
-    commit_success = (
-        gcs_utils.gcs_path_exists(f"{adapter_weights_path}/commit_success.txt")
-        if adapter_weights_path.startswith("gs://")
-        else os.path.exists(f"{adapter_weights_path}/commit_success.txt")
-    )
     if not commit_success:
       raise FileNotFoundError(f"Failed to read lora_weights from {adapter_weights_path}.")
 
