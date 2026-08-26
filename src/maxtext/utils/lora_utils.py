@@ -26,6 +26,7 @@ from flax.linen import partitioning as nn_partitioning
 from flax.training import train_state
 import jax
 import jax.numpy as jnp
+import numpy as np
 from orbax import checkpoint as ocp
 import qwix
 
@@ -654,7 +655,8 @@ def apply_lora_to_model(
       if replicated_sharding is not None:
         arr = val.get_value()
         if isinstance(arr, jax.Array) and arr.sharding != replicated_sharding:
-          resharded_arr = jax.make_array_from_callback(arr.shape, replicated_sharding, lambda idx, v=arr: v[idx])
+          arr_np = np.asarray(arr)
+          resharded_arr = jax.make_array_from_callback(arr.shape, replicated_sharding, lambda idx, v=arr_np: v[idx])
           val.set_value(resharded_arr)
 
   _verify_lora_parameters(lora_model, mt_config, matched_modules)
@@ -761,6 +763,9 @@ def restore_lora_from_path(model: nnx.Module, mt_config: pyconfig.HyperParameter
       matched_val = getattr(curr, "value")
     else:
       matched_val = curr
+
+    if isinstance(matched_val, jax.ShapeDtypeStruct):
+      raise ValueError(f"Parameter at path {'/'.join(str_path)} was not restored from checkpoint.")
 
     target_sharding = getattr(variable, "sharding", None)
     if not isinstance(target_sharding, jax.sharding.Sharding):
