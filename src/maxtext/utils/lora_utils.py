@@ -21,6 +21,7 @@ import os
 import re
 from typing import Optional
 
+from etils import epath
 from flax import nnx
 from flax.linen import partitioning as nn_partitioning
 from flax.training import train_state
@@ -159,22 +160,12 @@ def load_adapter(config, base_abstract_state_params, adapter_config_path, adapte
   lora_params = None
   lora_config = None
   if adapter_config_path:
-    if adapter_config_path.startswith("gs://"):
-      lora_config = gcs_utils.read_json_from_gcs(adapter_config_path)
-    else:
-      with open(adapter_config_path, "rt", encoding="utf8") as f:
-        lora_config = json.load(f)
+    try:
+      lora_config = json.loads(epath.Path(adapter_config_path).read_text())
+    except Exception as e:
+      raise FileNotFoundError(f"Failed to read lora_config from {adapter_config_path}: {e}") from e
 
-    if lora_config is None:
-      raise FileNotFoundError(f"Failed to read lora_config from {adapter_config_path}.")
-
-    commit_success_path = f"{adapter_weights_path}/commit_success.txt"
-    exists = (
-        gcs_utils.gcs_path_exists(commit_success_path)
-        if adapter_weights_path.startswith("gs://")
-        else os.path.exists(commit_success_path)
-    )
-    if not exists:
+    if not (epath.Path(adapter_weights_path) / "commit_success.txt").exists():
       raise FileNotFoundError(f"Failed to read lora_weights from {adapter_weights_path}.")
 
     if config.pure_nnx:
