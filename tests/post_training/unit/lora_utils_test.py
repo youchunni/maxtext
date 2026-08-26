@@ -342,6 +342,10 @@ class LoraUtilsTest(unittest.TestCase):
     """Test applying LoRA with a dummy mesh to trigger the multi-host reshard callback."""
     self._run_apply_lora_test(scan_layers=False, mock_multihost=True)
 
+  def test_apply_qlora_multihost_mock(self):
+    """Test applying QLoRA with a dummy mesh to verify QArray is untouched on multi-host."""
+    self._run_apply_lora_test(scan_layers=False, weight_qtype="int8", tile_size=32, mock_multihost=True)
+
   def test_restore_lora_from_path(self):
     """Test restoration of LoRA parameters from a path."""
     cfg = _make_config(
