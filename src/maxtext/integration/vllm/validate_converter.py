@@ -775,13 +775,6 @@ def validate_converter(argv) -> None:
     with _SyncPhase("WeightConverter.convert (conversion only)") as phase:
       maxtext_vllm_state = converter.convert(model_state, target_state=golden_llm_state)
       phase.block_on(maxtext_vllm_state)
-    for leaf in jax.tree_util.tree_leaves(model_state):
-      arr = leaf.value if hasattr(leaf, "value") else leaf
-      if hasattr(arr, "delete") and callable(arr.delete):
-        try:
-          arr.delete()
-        except Exception:
-          pass
     del model_state, model, mesh, converter
 
   gc.collect()
