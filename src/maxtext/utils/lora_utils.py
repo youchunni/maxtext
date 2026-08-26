@@ -168,16 +168,14 @@ def load_adapter(config, base_abstract_state_params, adapter_config_path, adapte
     if lora_config is None:
       raise FileNotFoundError(f"Failed to read lora_config from {adapter_config_path}.")
 
-    if adapter_weights_path.startswith("gs://"):
-      if not gcs_utils.gcs_path_exists(f"{adapter_weights_path}/commit_success.txt"):
-        raise FileNotFoundError(f"Failed to read lora_weights from {adapter_weights_path}.")
-    else:
-      if not (
-          os.path.exists(f"{adapter_weights_path}/commit_success.txt")
-          or os.path.exists(f"{adapter_weights_path}/_CHECKPOINT_METADATA")
-          or os.path.isdir(adapter_weights_path)
-      ):
-        raise FileNotFoundError(f"Failed to read lora_weights from {adapter_weights_path}.")
+    commit_success_path = f"{adapter_weights_path}/commit_success.txt"
+    exists = (
+        gcs_utils.gcs_path_exists(commit_success_path)
+        if adapter_weights_path.startswith("gs://")
+        else os.path.exists(commit_success_path)
+    )
+    if not exists:
+      raise FileNotFoundError(f"Failed to read lora_weights from {adapter_weights_path}.")
 
     if config.pure_nnx:
       lora_state, _ = get_lora_abstract_state_nnx(base_abstract_state_params, lora_config)
