@@ -367,7 +367,7 @@ def _reshard_and_assign_converted(maxtext_vllm_state, golden_llm_state, llm):
       src_flat,
       spec_flat,
       reshard_pytree,
-      chunk_size=128,
+      chunk_size=16,
       delete_spec_buffers=True,
   )
   resharded_weights = traverse_util.unflatten_dict(resharded_flat)
@@ -676,7 +676,7 @@ def validate_converter(argv) -> None:
       "load_format": vllm_load_format,
       "data_parallel_size": dp_size,
       "tensor_parallel_size": sampler_config.rollout_tensor_parallelism,
-      "gpu_memory_utilization": 0.55,
+      "gpu_memory_utilization": getattr(trainer_config, "hbm_utilization_vllm", 0.85),
       "num_gpu_blocks_override": 512,
       "async_scheduling": getattr(sampler_config, "async_scheduling", False),
   }
@@ -757,7 +757,7 @@ def validate_converter(argv) -> None:
           dst_state=golden_llm_state,
           reshard_fn=reshard_pytree,
           delete_dst_buffers=True,
-          reshard_chunk_size=128,
+          reshard_chunk_size=16,
       )
       phase.block_on(golden_llm_state)
     del model_state, model, mesh
@@ -775,6 +775,13 @@ def validate_converter(argv) -> None:
     with _SyncPhase("WeightConverter.convert (conversion only)") as phase:
       maxtext_vllm_state = converter.convert(model_state, target_state=golden_llm_state)
       phase.block_on(maxtext_vllm_state)
+    for leaf in jax.tree_util.tree_leaves(model_state):
+      arr = leaf.value if hasattr(leaf, "value") else leaf
+      if hasattr(arr, "delete") and callable(arr.delete):
+        try:
+          arr.delete()
+        except Exception:
+          pass
     del model_state, model, mesh, converter
 
   gc.collect()
