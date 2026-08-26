@@ -1063,10 +1063,14 @@ class AttentionOp(nnx.Module):
           return in_window & (distance >= 0)
 
         # For prefill and training phases (q_seq_len > 1):
-        # Use global buffer coordinates so causal/sliding mask is valid across packed sequences
-        local_next = next_pos[:, None] if isinstance(next_pos, jax.Array) else next_pos
-        row_ids = jnp.arange(q_seq_len)[None, :, None] + local_next
-        col_ids = jnp.arange(s_len)[None, None, :]
+        if use_segment_positions:
+          row_ids = position_row_ids
+          col_ids = position_col_ids[:, :, :s_len]
+        else:
+          # Use global buffer coordinates so causal/sliding mask is valid across packed sequences
+          local_next = next_pos[:, None] if isinstance(next_pos, jax.Array) else next_pos
+          row_ids = jnp.arange(q_seq_len)[None, :, None] + local_next
+          col_ids = jnp.arange(s_len)[None, None, :]
         distance = row_ids - col_ids
         in_window = (distance < self.sliding_window_size) if self.sliding_window_size is not None else True
         return in_window & (distance >= 0)

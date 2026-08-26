@@ -4875,6 +4875,61 @@ class DeepSeekV4AttentionMaskingTest(unittest.TestCase):
     self.assertEqual(mask_none_np[0, 0], 0.0)
     self.assertEqual(mask_none_np[0, 1], DEFAULT_MASK_VALUE)
 
+  def test_generate_attention_mask_compressed_load_balanced_context_parallel(self):
+    """Verifies that AttentionType.COMPRESSED correctly uses segment_positions under load-balanced CP."""
+    config = types.SimpleNamespace(
+        context_parallel_load_balance=True,
+        context_sharding="context",
+        using_pipeline_parallelism=False,
+        logical_axis_rules=[["segment_ids_batch", ["context"]]],
+        shard_mode="auto",
+        debug_sharding=False,
+        eval_interval=-1,
+    )
+    devices = jax.devices()
+    if len(devices) < 4:
+      self.skipTest("Need at least 4 devices to test load balanced CP")
+    mesh = Mesh(devices[:4], ["context"])
+    seq_len = 16
+    c_len = 2
+    kv_len = seq_len + c_len
+    sliding_window_size = 4
+    positions = jnp.asarray(attention_op.LoadBalancedCausalMask(shape=(seq_len, seq_len), cp_size=4).q_sequence[None, :])
+    query = jnp.zeros((1, seq_len, 1, 128))
+    key = jnp.zeros((1, kv_len, 1, 128))
+    decoder_segment_ids = jnp.ones((1, seq_len), dtype=jnp.int32)
+    compressed_mask = jnp.zeros((1, 1, seq_len, c_len), dtype=jnp.float32)
+
+    op = AttentionOp(
+        config=config,
+        num_query_heads=1,
+        num_kv_heads=1,
+        max_target_length=kv_len,
+        mesh=mesh,
+        attention_kernel="dot_product",
+        attention_type=AttentionType.COMPRESSED,
+        sliding_window_size=sliding_window_size,
+    )
+
+    mask = op.generate_attention_mask(
+        query,
+        key,
+        decoder_segment_ids,
+        MODEL_MODE_TRAIN,
+        compressed_mask=compressed_mask,
+        segment_positions=positions,
+    )
+
+    expected_uncompressed_mask = np.zeros((seq_len, seq_len), dtype=np.bool_)
+    for r, q_pos in enumerate(np.asarray(positions[0])):
+      for c, kv_pos in enumerate(np.asarray(positions[0])):
+        if q_pos - sliding_window_size < kv_pos <= q_pos:
+          expected_uncompressed_mask[r, c] = True
+
+    mask_np = np.asarray(mask)[0, 0, 0] if mask.ndim == 5 else np.asarray(mask)[0, 0]
+    np.testing.assert_array_equal(mask_np[:, :seq_len] == 0.0, expected_uncompressed_mask)
+    np.testing.assert_array_equal(mask_np[:, seq_len:], 0.0)
+
 
 class CompressedAttentionTest(parameterized.TestCase):
   """Parity and compilation tests for CompressedAttention (DeepSeek-V4)."""
