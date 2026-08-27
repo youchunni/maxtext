@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Tests for Attentions."""
 
 import itertools
@@ -818,6 +819,10 @@ class LoadBalancedMaskTest(unittest.TestCase):
     np.testing.assert_array_equal(np.asarray(mask == 0.0)[0, 0, 0], expected_mask)
 
 
+# Records every lazy_init on the bridged TE attention module (b/552606153).
+_TE_BRIDGE_LAZY_INITS = []
+
+
 class CudnnTePackedSequenceDescriptorTest(unittest.TestCase):
   """Tests packed Transformer Engine attention metadata handling."""
 
@@ -826,10 +831,16 @@ class CudnnTePackedSequenceDescriptorTest(unittest.TestCase):
   ):
     """Runs TE attention with fake Transformer Engine modules."""
     sequence_descriptor.calls = []
+    _TE_BRIDGE_LAZY_INITS.clear()
 
     class FakeWrappedAttention:
+      """Stands in for the ToNNX-wrapped TE DotProductAttention."""
 
       def lazy_init(self, *args, **kwargs):  # pylint: disable=unused-argument
+        # Recorded, not forbidden, so a single test can assert on it. TE's
+        # DotProductAttention declares no variables, so priming the bridge only
+        # bought a second full forward trace per layer. See b/552606153.
+        _TE_BRIDGE_LAZY_INITS.append(kwargs.get("sequence_descriptor"))
         return self
 
       def __call__(self, *args, **kwargs):
@@ -894,6 +905,36 @@ class CudnnTePackedSequenceDescriptorTest(unittest.TestCase):
 
     return output, sequence_descriptor.calls
 
+  def test_te_attention_bridge_is_not_lazy_initialized(self):
+    """The TE attention bridge must not be primed with a throwaway forward pass.
+
+    TE's DotProductAttention declares no variables -- Linen init() on it returns an
+    empty collection dict, and calling it without lazy_init gives identical output.
+    Priming it therefore initialized nothing while costing a second complete forward
+    trace at max_target_length, plus dummy tensors including a
+    (1, 1, 1, max_target_length, max_target_length) mask. Scanned that was one extra
+    trace; with scan_layers=False the decoder is unrolled, so it was one per layer.
+    See b/552606153.
+    """
+
+    class SequenceDescriptor:
+      calls = []
+      reject_thd_kwargs = False
+
+      @classmethod
+      def from_segment_ids_and_pos(cls, **kwargs):
+        cls.calls.append(kwargs)
+        return kwargs
+
+    self._call_te_attention(SequenceDescriptor)
+    self.assertEqual(
+        _TE_BRIDGE_LAZY_INITS,
+        [],
+        "cudnn_flash_attention must not lazy_init the bridged TE DotProductAttention; "
+        "it has no variables to initialize and the extra trace costs compile time per "
+        "unrolled layer. See b/552606153.",
+    )
+
   def test_packed_attention_sequence_descriptor_uses_thd_metadata_with_legacy_fallback(self):
     class SequenceDescriptor:
       calls = []
@@ -906,21 +947,25 @@ class CudnnTePackedSequenceDescriptorTest(unittest.TestCase):
           raise TypeError("older Transformer Engine does not accept THD metadata")
         return kwargs
 
+    # One descriptor per attention call. This used to be two: a second, identical
+    # descriptor was built purely to feed a lazy_init of the TE bridge, which was
+    # removed once TE's DotProductAttention was confirmed to declare no variables
+    # (b/552606153). The fallback behaviour under test is unchanged.
     output, descriptor_calls = self._call_te_attention(SequenceDescriptor)
 
-    self.assertEqual(len(descriptor_calls), 2)
+    self.assertEqual(len(descriptor_calls), 1)
     for call in descriptor_calls:
       self.assertTrue(call["is_thd"])
       self.assertFalse(call["is_segment_ids_reordered"])
     self.assertIs(output, descriptor_calls[0])
 
+    # Legacy TE rejects the THD kwargs, so each descriptor costs two calls: the THD
+    # attempt and the fallback.
     SequenceDescriptor.reject_thd_kwargs = True
     output, descriptor_calls = self._call_te_attention(SequenceDescriptor)
-    self.assertEqual(len(descriptor_calls), 4)
+    self.assertEqual(len(descriptor_calls), 2)
     self.assertIn("is_thd", descriptor_calls[0])
     self.assertNotIn("is_thd", descriptor_calls[1])
-    self.assertIn("is_thd", descriptor_calls[2])
-    self.assertNotIn("is_thd", descriptor_calls[3])
     self.assertIs(output, descriptor_calls[1])
 
   def test_context_parallel_chunk_attention_rejected(self):

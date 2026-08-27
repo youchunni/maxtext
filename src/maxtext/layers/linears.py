@@ -212,6 +212,10 @@ class DenseGeneral(nnx.Module):
       block_size = getattr(quant, "get_block_size", lambda: 1)()  # needed for TE MXFP8
       dummy_inputs = jnp.zeros((block_size, *self.in_features_shape), dtype=self.dtype)
       self(dummy_inputs, _initializing=True)
+      # Backends that never draw at apply time can drop the bridge's forked Rngs, which
+      # keeps a (key, count) pair per stream out of the model state. See b/552606153.
+      if not quant.needs_apply_rngs:
+        quant_dot_general.release_rngs()
     else:
       self._quant_dot_general_name = None
 

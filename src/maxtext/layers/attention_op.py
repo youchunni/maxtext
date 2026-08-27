@@ -2299,9 +2299,6 @@ class AttentionOp(nnx.Module):
           return SequenceDescriptor.from_segment_ids_and_pos(segment_ids=segment_ids, segment_pos=segment_positions)
 
       attn_mask = _sequence_descriptor(decoder_segment_ids)
-      # Create dummy SequenceDescriptor for lazy_init
-      dummy_segment_ids = jnp.ones(shape=query.shape[:2], dtype=jnp.int32)
-      dummy_attn_mask = _sequence_descriptor(dummy_segment_ids)
       max_segments_per_seq = self.config.max_segments_per_seq
     elif using_context_parallelism:
       if self.attention_type == AttentionType.LOCAL_SLIDING:
@@ -2311,19 +2308,13 @@ class AttentionOp(nnx.Module):
         )
       # Context parallelism without packing: only supports causal masking, but not sliding window attention
       attn_mask = None
-      dummy_attn_mask = None
       mask_type = "causal"
     elif model_mode == MODEL_MODE_PREFILL and self.config.attention_kernel == "cudnn":
       # Prefill with CUDNN attention does not support packing or context parallelism.
       attn_mask = None
-      dummy_attn_mask = None
       mask_type = "causal"
     else:
       # Default case: no packing, no context parallelism
-      dummy_attn_mask = jnp.zeros(
-          (1, 1, 1, self.max_target_length, self.max_target_length),
-          dtype=jnp.uint8,
-      )
       attn_mask = self.generate_attention_mask(query, key, decoder_segment_ids, model_mode)
       attn_mask = jnp.where((attn_mask >= DEFAULT_MASK_VALUE * 0.5), 0, 1).astype(jnp.uint8)
 
@@ -2347,26 +2338,10 @@ class AttentionOp(nnx.Module):
         max_segments_per_seq=max_segments_per_seq,
     )
 
+    # No lazy_init: TE's DotProductAttention declares no variables, so priming the
+    # bridge only cost a second forward trace at max_target_length, once per layer
+    # once scan_layers=False unrolls the decoder. See b/552606153.
     dpa_layer = nnx_wrappers.ToNNX(dpa_layer, rngs=self.rngs)
-    dummy_query_prefill = jnp.zeros(
-        (1, self.max_target_length, self.num_query_heads, self.config.head_dim),
-        dtype=self.dtype,
-    )
-    dummy_key_prefill = jnp.zeros(
-        (1, self.max_target_length, self.num_kv_heads, self.config.head_dim),
-        dtype=self.dtype,
-    )
-    dummy_value_prefill = jnp.zeros(
-        (1, self.max_target_length, self.num_kv_heads, self.config.head_dim),
-        dtype=self.dtype,
-    )
-
-    dpa_layer.lazy_init(
-        dummy_query_prefill,
-        dummy_key_prefill,
-        dummy_value_prefill,
-        sequence_descriptor=dummy_attn_mask,
-    )
     return dpa_layer(query, key, value, sequence_descriptor=attn_mask)
 
   def cudnn_jax_flash_attention(

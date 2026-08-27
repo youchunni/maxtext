@@ -18,7 +18,7 @@ import functools
 import json
 import qwix.pallas as qpl
 import re
-from typing import Tuple, Sequence, Callable
+from typing import ClassVar, Tuple, Sequence, Callable
 from dataclasses import dataclass
 
 from aqt.jax.v2 import config as aqt_config
@@ -79,6 +79,11 @@ _TILE_SIZE = "tile_size"  # Tile size for subchannel
 @dataclass
 class Quantization:
   """Base class for quantization configurations"""
+
+  # Whether this backend's dot_general draws RNGs at apply time, as AQT stochastic
+  # rounding does. When False, the Linen->NNX bridge around it can drop its forked
+  # Rngs after init. Defaults to True so a backend only opts out deliberately.
+  needs_apply_rngs: ClassVar[bool] = True
 
   def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
     """Placeholder for dot_general implementation in subclasses."""
@@ -143,6 +148,11 @@ def _rhs_axis_metadata_wrapper(
 @dataclass
 class AqtQuantization:
   """Configures AQT quantization github.com/google/aqt."""
+
+  # AQT's config sets rng_type="jax.uniform" and stochastic rounding draws at
+  # apply time, so the bridge must keep its RNGs. Declared rather than
+  # inherited: this class stands outside the Quantization hierarchy.
+  needs_apply_rngs: ClassVar[bool] = True
 
   quant_dg: aqt_config.DotGeneral
   quant_mode: aqt_flax.QuantMode = aqt_flax.QuantMode.TRAIN
@@ -225,6 +235,10 @@ class AqtQuantization:
 @dataclass
 class QwixQuantization:
   """Configures Qwix quantization github.com/google/qwix, for training only."""
+
+  # Qwix wraps AQT-style numerics, so assume it draws at apply time. Declared rather than
+  # inherited: this class stands outside the Quantization hierarchy.
+  needs_apply_rngs: ClassVar[bool] = True
 
   quant_mode = "train"  # needed by external call
   act_calibration_method: str = "absmax"
@@ -1050,6 +1064,10 @@ def manual_quantize(tensor: jax.Array, dtype: jax.typing.DTypeLike, calibration_
 
 class TransformerEngineQuantization(Quantization):
   """Class for TransformerEngine quantization recipes."""
+
+  # TE's dense() takes its scales from the tensors and never calls make_rng at apply
+  # time, so the bridge around it need not keep RNG state. See b/552606153.
+  needs_apply_rngs: ClassVar[bool] = False
 
   def __init__(self, config):
     """Initialize TransformerEngine quantization."""

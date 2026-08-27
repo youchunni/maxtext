@@ -231,6 +231,20 @@ class ToNNX(Module):
     """A shortcut of calling `nnx.bridge.lazy_init()` upon this module."""
     return lazy_init(self, *args, **kwargs)
 
+  def release_rngs(self):
+    """Drops the forked ``Rngs`` so it stops being part of the model state.
+
+    ``__call__`` draws every stream on every invocation, so each stream's
+    ``(key, count)`` pair is carried through the train step and its counter
+    incremented on device once per call. That is pure overhead for a module that
+    never calls ``make_rng`` at apply time, and it is paid per bridged instance, so
+    it scales with the layer count once ``scan_layers=False`` unrolls the decoder.
+
+    Only safe after the wrapped module is initialized; init itself needs the RNGs.
+    See b/552606153.
+    """
+    self.to_nnx__rngs = None
+
   def __getattr__(self, name: str):
     if hasattr(super(), name):
       return super().__getattribute__(name)
