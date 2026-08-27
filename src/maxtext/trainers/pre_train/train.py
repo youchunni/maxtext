@@ -1023,12 +1023,14 @@ def recover(
               replicated_abstract_dict = train_utils.replicate_single_device_sharded_arrays(abstract_dict)
               restored_dict = snapshot_mgr.load(replicated_abstract_dict)
               restored_dict = train_utils.restore_original_shardings(restored_dict, abstract_dict)
+
               merged = jax.tree.map(
                   lambda ckpt, init: init if isinstance(ckpt, jax.ShapeDtypeStruct) else ckpt,
                   restored_dict,
                   abstract_dict,
                   is_leaf=lambda x: isinstance(x, jax.ShapeDtypeStruct),
               )
+
               m_state = nnx.state(state.model)
               nnx.replace_by_pure_dict(m_state, merged["model"])
               nnx.update(state.model, m_state)
@@ -1074,8 +1076,10 @@ def recover(
           metric_logger_instance.learning_rate_schedule = learning_rate_schedule
 
       # Update jax_device_state with the newly built JAX objects
-      if not isinstance(model, nn.Module) and isinstance(restored_state, train_state_nnx.TrainStateNNX):
-        _, restored_state = nnx.split(restored_state)
+      if not isinstance(model, nn.Module):
+        if isinstance(restored_state, train_state_nnx.TrainStateNNX):
+          _, restored_state = nnx.split(restored_state)
+        restored_state = train_state_nnx._strip_rng_state(restored_state)
       jax_device_state["state"] = restored_state
       jax_device_state["init_rng"] = init_rng
       jax_device_state["model"] = model
