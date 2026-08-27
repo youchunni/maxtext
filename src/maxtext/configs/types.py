@@ -2805,6 +2805,37 @@ class DerivedValues(BaseModel):
 # ----------------------------------------------------------------------------
 
 
+# Decoder blocks that support replaying forced router expert decisions
+# (`forced_routed_experts`), for both scanned (`scan_layers=True`) and
+# unscanned training. Every other decoder block does not support forced
+# routing at all.
+FORCED_ROUTING_SUPPORTED_DECODER_BLOCKS = (
+    DecoderBlockType.QWEN3_5,
+    DecoderBlockType.MIXTRAL,
+    DecoderBlockType.LLAMA4,
+    DecoderBlockType.ENVY,
+    DecoderBlockType.GEMMA4,
+)
+
+
+def check_forced_routing_support(decoder_block: DecoderBlockType) -> None:
+  """Raises if forced routing (router replay) is requested for a decoder_block
+  that doesn't support it, scanned or not.
+
+  Args:
+    decoder_block: The model's decoder block type.
+
+  Raises:
+    NotImplementedError: If decoder_block is not one of
+      FORCED_ROUTING_SUPPORTED_DECODER_BLOCKS.
+  """
+  if decoder_block not in FORCED_ROUTING_SUPPORTED_DECODER_BLOCKS:
+    raise NotImplementedError(
+        "Forced routing (router replay) is only supported for decoder_block in "
+        f"{FORCED_ROUTING_SUPPORTED_DECODER_BLOCKS}; got decoder_block={decoder_block!r}."
+    )
+
+
 def _normalize_axes(axes: Any) -> tuple[str, ...]:
   """Normalize a logical-rule mapping value to a tuple of axis name strings.
 

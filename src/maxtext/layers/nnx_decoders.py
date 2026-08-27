@@ -36,6 +36,7 @@ from maxtext.common.common_types import (
     MultimodalInput,
     ShardMode,
 )
+from maxtext.configs.types import check_forced_routing_support
 from maxtext.layers import initializers, linears, mhc, moe, normalizations, quantizations
 from maxtext.layers import nnx_scan, nnx_wrappers
 from maxtext.layers.attentions import Attention
@@ -226,6 +227,46 @@ class NNXDecoderLayer(nnx.Module):
       return layer_output, None
     else:
       return layer_output, kv_cache
+
+
+def reshape_forced_routed_experts_for_scan(
+    forced_routed_experts: jax.Array,
+    num_moe_layers: int,
+    scan_length: int,
+    moe_per_cycle: int,
+) -> jax.Array:
+  """Reshapes a batch's forced_routed_experts for a nested-cycle scan.
+
+  The outer scan repeats a "cycle" of sub-layers `scan_length` times, of which
+  `moe_per_cycle` are MoE layers (e.g. all of them for a homogeneous-MoE
+  architecture like QWEN3_5, or a subset for an interleaved one like LLAMA4 /
+  ENVY). jax.lax.scan needs an xs array whose leading axis is `scan_length` so
+  it can slice one cycle's worth per outer iteration, and the static Python
+  loop inside e.g. `Qwen3_5ScannableBlock` then slices the per-sub-layer entry
+  out of that cycle chunk -- for interleaved architectures, using a running
+  counter over MoE sub-layers only, matching the `moe_lyr_idx` convention used
+  for the unscanned per-layer case.
+
+  Args:
+    forced_routed_experts: Either `[batch, seq, num_moe_layers, top_k]` (a
+      distinct routing per MoE layer -- note the layer axis only counts MoE
+      layers, not dense ones) or `[batch, seq, top_k]` (the same routing
+      broadcast to every MoE layer).
+    num_moe_layers: Total number of MoE layers (`scan_length * moe_per_cycle`).
+    scan_length: Number of outer scan iterations.
+    moe_per_cycle: Number of MoE sub-layers per cycle.
+
+  Returns:
+    Array shaped `[scan_length, moe_per_cycle, batch, seq, top_k]`.
+  """
+  fre = forced_routed_experts
+  if fre.ndim == 4:
+    # [batch, seq, num_moe_layers, top_k] -> [num_moe_layers, batch, seq, top_k]
+    fre = jnp.moveaxis(fre, 2, 0)
+  else:
+    # [batch, seq, top_k]: same forced routing for every MoE layer.
+    fre = jnp.broadcast_to(fre[None], (num_moe_layers,) + fre.shape)
+  return jnp.reshape(fre, (scan_length, moe_per_cycle) + fre.shape[1:])
 
 
 def deepstack_process(hidden_states, bidirectional_mask, visual_embeds):
@@ -926,6 +967,7 @@ class NNXDecoder(nnx.Module):
       skip_block_remat: bool = False,
       unroll: int = 1,
       metadata_axis_name: str = "layers",
+      forced_routed_experts_scanned=None,
       **kwargs,
   ):
     """Runs the layer stack using nnx.scan.
@@ -952,6 +994,11 @@ class NNXDecoder(nnx.Module):
         This must perfectly match the string passed to `_create_scanned_layers`
         (e.g., "layers", "scanned_blocks") to prevent strict JAX `pjit` PyTree
         metadata mismatch errors when using custom `nnx.Variable` types (like `MoEBiasVar`).
+      forced_routed_experts_scanned: Optional array shaped `[length, ...]`, i.e.
+        one slice per scan iteration (unlike the broadcast **kwargs, which are
+        identical every iteration). Threaded through jax.lax.scan's xs alongside
+        params/state so each layer sees its own forced-routing slice, and passed
+        to the layer as `forced_routed_experts=`.
       **kwargs: Keyword args forwarded to the layer (filtered by the layer signature).
 
     Returns:
@@ -987,6 +1034,11 @@ class NNXDecoder(nnx.Module):
     updated_graphdef = [graphdef]
 
     use_kv = kv_caches_stacked is not None
+    use_forced_routing = forced_routed_experts_scanned is not None
+    if use_kv and use_forced_routing:
+      raise NotImplementedError(
+          "Forced routing is not supported together with externally-managed (vLLM) kv_caches in scanned layers."
+      )
 
     def layer_fn(carry, scanned_vars):
       # Ensure metadata rank matches the sliced values
@@ -995,9 +1047,14 @@ class NNXDecoder(nnx.Module):
       # Unpack the sliced variables for THIS layer
       if use_kv:
         current_params, current_state, kv_cache_layer = scanned_vars
+        forced_routed_experts_layer = None
+      elif use_forced_routing:
+        current_params, current_state, forced_routed_experts_layer = scanned_vars
+        kv_cache_layer = None
       else:
         current_params, current_state = scanned_vars
         kv_cache_layer = None
+        forced_routed_experts_layer = None
 
       if self.config.parameter_memory_host_offload:
         current_params = jax.tree.map(
@@ -1007,10 +1064,12 @@ class NNXDecoder(nnx.Module):
 
       layer = nnx.merge(graphdef, current_params, current_state)
 
-      # Build call kwargs, injecting per-layer kv_cache when available
+      # Build call kwargs, injecting per-layer kv_cache / forced routing when available
       call_kwargs = dict(valid_kwargs)
       if kv_cache_layer is not None:
         call_kwargs["kv_cache"] = kv_cache_layer
+      if use_forced_routing:
+        call_kwargs["forced_routed_experts"] = forced_routed_experts_layer
 
       layer_out = layer(carry, *args, **call_kwargs)
 
@@ -1074,7 +1133,11 @@ class NNXDecoder(nnx.Module):
       params = maxtext_utils_nnx.nnx_ensure_scan_leading_axis(params, length)
       state = maxtext_utils_nnx.nnx_ensure_scan_leading_axis(state, length)
 
-      final_carry, scanned_state = jax.lax.scan(layer_fn_wrapped, x_in, (params, state), unroll=unroll)
+      if use_forced_routing:
+        scan_xs = (params, state, forced_routed_experts_scanned)
+      else:
+        scan_xs = (params, state)
+      final_carry, scanned_state = jax.lax.scan(layer_fn_wrapped, x_in, scan_xs, unroll=unroll)
       returned_kv_stacked = None
 
       # Move the scan axis to each variable's param_scan_axis and restore its name
@@ -1601,9 +1664,26 @@ class NNXDecoder(nnx.Module):
       attention_metadata=None,
       deepstack_visual_embeds: None | list[jnp.ndarray] = None,
       multimodal_input: None | MultimodalInput = None,
+      forced_routed_experts: jnp.ndarray | None = None,
   ):
     cfg = self.config
     assert decoder_input_tokens.ndim == 2  # [batch, len]
+
+    if forced_routed_experts is not None:
+      check_forced_routing_support(cfg.decoder_block)
+      if cfg.scan_layers and cfg.decoder_block == DecoderBlockType.GEMMA4:
+        # Gemma4's scanned path (_apply_gemma4_scanned_blocks) is a distinct,
+        # triple-nested scan (an outer block scan, an inner local-sliding-layer
+        # scan, a length-1 global-layer scan, plus a non-scanned remainder
+        # block) that forced_routed_experts is not yet threaded through. Fail
+        # loudly here instead of silently dropping it (the generic
+        # _apply_layers_sequentially kwarg filter would otherwise strip it
+        # since Gemma4ScannableBlock.__call__ doesn't accept it).
+        raise NotImplementedError(
+            "Forced routing with scan_layers=True is not yet implemented for GEMMA4 "
+            "(its scanned path is structurally different from the other supported "
+            "architectures); set scan_layers=False to use forced routing with Gemma4."
+        )
 
     policy = self.get_remat_policy()
 
@@ -1647,6 +1727,9 @@ class NNXDecoder(nnx.Module):
 
     if cfg.engram_layers and decoder_input_tokens is not None:
       layer_kwargs["decoder_input_tokens"] = decoder_input_tokens
+
+    if forced_routed_experts is not None:
+      layer_kwargs["forced_routed_experts"] = forced_routed_experts
 
     if getattr(cfg, "using_pipeline_parallelism", False):
       logical_partition_spec = (
@@ -1778,7 +1861,6 @@ class NNXDecoder(nnx.Module):
                 "layer_kwargs": layer_kwargs,
                 "decoder_input_tokens": decoder_input_tokens,
             }
-
             y = self._apply_interleaved_scanned_layers(
                 y,
                 "dense_layers",
@@ -1788,7 +1870,6 @@ class NNXDecoder(nnx.Module):
                 *layer_args,
                 **common_kwargs,
             )
-
             y = self._apply_interleaved_scanned_layers(
                 y,
                 "moe_layers",
@@ -1870,7 +1951,46 @@ class NNXDecoder(nnx.Module):
               kv_caches=kv_caches,
           )
         else:
-          scan_length = int(cfg.num_decoder_layers / cfg.inhomogeneous_layer_cycle_interval)
+          cycle_interval = cfg.inhomogeneous_layer_cycle_interval
+          scan_length = int(cfg.num_decoder_layers / cycle_interval)
+          forced_routed_experts_scanned = None
+          if forced_routed_experts is not None:
+            # check_forced_routing_support (above) already guarantees only
+            # MIXTRAL, LLAMA4, ENVY, or QWEN3_5 reach here with forced routing.
+            if cfg.decoder_block == DecoderBlockType.MIXTRAL:
+              # No ScannableBlock wrapper for Mixtral: every scan iteration is
+              # exactly one (always-MoE) decoder layer, so there is no
+              # per-cycle nesting to slice out.
+              forced_routed_experts_scanned = reshape_forced_routed_experts_for_scan(
+                  forced_routed_experts,
+                  num_moe_layers=cfg.num_decoder_layers,
+                  scan_length=scan_length,
+                  moe_per_cycle=1,
+              )
+              forced_routed_experts_scanned = jnp.squeeze(forced_routed_experts_scanned, axis=1)
+            elif cfg.decoder_block in (DecoderBlockType.LLAMA4, DecoderBlockType.ENVY):
+              # Llama4/Envy interleave dense and MoE sub-layers within each
+              # cycle; only the MoE ones get a forced-routing slice, indexed
+              # by a running MoE-only counter (mirroring `moe_lyr_idx` in the
+              # unscanned path), not by raw sub-layer position.
+              moe_per_cycle = sum(
+                  1 for i in range(cycle_interval) if llama4.determine_is_moe_layer(i, cfg.interleave_moe_layer_step)
+              )
+              forced_routed_experts_scanned = reshape_forced_routed_experts_for_scan(
+                  forced_routed_experts,
+                  num_moe_layers=scan_length * moe_per_cycle,
+                  scan_length=scan_length,
+                  moe_per_cycle=moe_per_cycle,
+              )
+            else:
+              # QWEN3_5 (and any other homogeneous-MoE ScannableBlock): every
+              # sub-layer in the cycle is MoE.
+              forced_routed_experts_scanned = reshape_forced_routed_experts_for_scan(
+                  forced_routed_experts,
+                  num_moe_layers=cfg.num_decoder_layers,
+                  scan_length=scan_length,
+                  moe_per_cycle=cycle_interval,
+              )
           if kv_caches is not None:
             # Pass the kv_caches list directly to avoid copying in jnp.stack,
             # which breaks vLLM PagedAttention in-place memory updates.
@@ -1890,20 +2010,23 @@ class NNXDecoder(nnx.Module):
                 y,
                 *layer_args,
                 length=scan_length,
+                forced_routed_experts_scanned=forced_routed_experts_scanned,
                 **layer_kwargs,
             )
       else:
         prevent_cse = maxtext_utils.should_prevent_cse_in_remat(cfg)
         dynamic_graph_init = bool(getattr(self, "disable_quant_stats_update", False))
 
-        def pure_layer_fn(graphdef_in, state_in, y_in, kv_in):
+        def pure_layer_fn(graphdef_in, state_in, y_in, kv_in, valid_kwargs=None):
+          if valid_kwargs is None:
+            valid_kwargs = layer_kwargs
           if cfg.parameter_memory_host_offload:
             state_in = jax.tree.map(
                 lambda x: jax.device_put(x, max_utils.device_space()),
                 state_in,
             )
           merged_layer = nnx.merge(graphdef_in, state_in)
-          out_y, out_kv = merged_layer(y_in, *layer_args, kv_cache=kv_in, **layer_kwargs)
+          out_y, out_kv = merged_layer(y_in, *layer_args, kv_cache=kv_in, **valid_kwargs)
           state_out = nnx.state(merged_layer)
 
           if dynamic_graph_init:
@@ -1914,6 +2037,7 @@ class NNXDecoder(nnx.Module):
 
         checkpointed_fn = jax.checkpoint(pure_layer_fn, policy=policy, prevent_cse=prevent_cse)
 
+        moe_lyr_idx = 0
         for lyr in range(cfg.num_decoder_layers):
           if self.is_deepseek:
             if lyr < cfg.first_num_dense_layers:
@@ -1960,10 +2084,39 @@ class NNXDecoder(nnx.Module):
           if input_tokens is not None:
             layer_kwargs["decoder_input_tokens"] = input_tokens
 
-          if cfg.remat_policy != "none":
-            y, kv_cache, new_state, new_graphdef = checkpointed_fn(graphdef, state, y, kv_cache)
+          current_kwargs = dict(layer_kwargs)
+
+          is_moe = False
+          if cfg.decoder_block in (
+              DecoderBlockType.MIXTRAL,
+              DecoderBlockType.QWEN3_MOE,
+              DecoderBlockType.QWEN3_NEXT,
+              DecoderBlockType.QWEN3_5,
+              DecoderBlockType.QWEN3_CUSTOM_MOE,
+              DecoderBlockType.GEMMA4,
+          ):
+            is_moe = True
+          elif cfg.decoder_block == DecoderBlockType.DEEPSEEK:
+            is_moe = lyr >= cfg.first_num_dense_layers
+          elif cfg.decoder_block in (DecoderBlockType.LLAMA4, DecoderBlockType.ENVY):
+            is_moe = llama4.determine_is_moe_layer(lyr, self.config.interleave_moe_layer_step)
+
+          if is_moe and "forced_routed_experts" in current_kwargs and current_kwargs["forced_routed_experts"] is not None:
+            routed_experts = current_kwargs["forced_routed_experts"]
+            if routed_experts.ndim == 4:
+              current_kwargs["forced_routed_experts"] = routed_experts[:, :, moe_lyr_idx, :]
+            else:
+              current_kwargs["forced_routed_experts"] = routed_experts
+            moe_lyr_idx += 1
           else:
-            y, kv_cache, new_state, new_graphdef = pure_layer_fn(graphdef, state, y, kv_cache)
+            current_kwargs.pop("forced_routed_experts", None)
+            if is_moe:
+              moe_lyr_idx += 1
+
+          if cfg.remat_policy != "none":
+            y, kv_cache, new_state, new_graphdef = checkpointed_fn(graphdef, state, y, kv_cache, current_kwargs)
+          else:
+            y, kv_cache, new_state, new_graphdef = pure_layer_fn(graphdef, state, y, kv_cache, current_kwargs)
 
           if dynamic_graph_init:
             new_layer = nnx.merge(new_graphdef, new_state)

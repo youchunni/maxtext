@@ -452,8 +452,9 @@ class _MTPLossFnTestModel(nnx.Module):
       enable_dropout=False,
       decoder_target_tokens=None,
       decoder_target_mask=None,
+      forced_routed_experts=None,
   ):
-    del encoder_images, encoder_image_masks, enable_dropout
+    del encoder_images, encoder_image_masks, enable_dropout, forced_routed_experts
     main_hidden_state = self._shared_embedding(decoder_input_tokens)
     self.mtp_block(
         self._shared_embedding,

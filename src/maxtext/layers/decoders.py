@@ -29,6 +29,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh
 from maxtext.common.common_types import Config, DecoderBlockType, ShardMode
 from maxtext.common.common_types import MODEL_MODE_AUTOREGRESSIVE, MODEL_MODE_PREFILL, MODEL_MODE_TRAIN
+from maxtext.configs.types import check_forced_routing_support
 from maxtext.layers import linears
 from maxtext.layers import mhc
 from maxtext.layers import normalizations
@@ -863,10 +864,23 @@ class Decoder(nn.Module):
       kv_caches: list[jax.Array] | None = None,
       attention_metadata=None,
       deepstack_visual_embeds: None | list[jnp.ndarray] = None,
+      forced_routed_experts: jnp.ndarray | None = None,
   ):
     cfg = self.config
     mesh = self.mesh
     assert decoder_input_tokens.ndim == 2  # [batch, len]
+
+    if forced_routed_experts is not None:
+      check_forced_routing_support(cfg.decoder_block)
+      if cfg.scan_layers:
+        # Scanned forced-routing support (see check_forced_routing_support for
+        # which decoder_blocks) is implemented for the pure-NNX decoder
+        # (nnx_decoders.py) only; this legacy Linen decoder path does not yet
+        # thread per-layer routing decisions through its `nn.scan` call.
+        raise NotImplementedError(
+            "Forced routing with scanned layers is only supported via the pure-NNX decoder "
+            "(pure_nnx_decoder=True); this Linen decoder path does not support it yet."
+        )
 
     # [batch, length] -> [batch, length, emb_dim]
     y = self._apply_embedding(
@@ -1166,6 +1180,10 @@ class Decoder(nn.Module):
               global_layer_idx = global_layer_idx_offset + index
               kv_cache = kv_caches[index] if kv_caches is not None else None
               input_tokens = decoder_input_tokens if cfg.engram_layers else None
+              current_forced_routed_experts = None
+              if forced_routed_experts is not None and layer_prefix == "moe_layers":
+                current_forced_routed_experts = forced_routed_experts[:, :, index, :]
+
               y, kv_cache = layer(
                   config=cfg,
                   mesh=mesh,
@@ -1184,6 +1202,7 @@ class Decoder(nn.Module):
                   kv_cache=kv_cache,
                   attention_metadata=attention_metadata,
                   decoder_input_tokens=input_tokens,
+                  forced_routed_experts=current_forced_routed_experts,
               )
               if kv_caches is not None and kv_cache is not None:
                 kv_caches[index] = kv_cache
@@ -1203,6 +1222,7 @@ class Decoder(nn.Module):
               slot=slot,
           )
         else:
+          moe_lyr_idx = 0
           for lyr in range(cfg.num_decoder_layers):
             RemattedBlockLayer = RemattedBlockLayers[0]
             layer_kwargs = {}
@@ -1246,17 +1266,47 @@ class Decoder(nn.Module):
             layer = RemattedBlockLayer(
                 config=cfg, mesh=mesh, name=f"layers_{lyr}", quant=self.quant, model_mode=self.model_mode, **layer_kwargs
             )
+            current_forced_routed_experts = None
+            is_moe = False
+            if cfg.decoder_block in (
+                DecoderBlockType.MIXTRAL,
+                DecoderBlockType.QWEN3_MOE,
+                DecoderBlockType.QWEN3_NEXT,
+                DecoderBlockType.QWEN3_5,
+                DecoderBlockType.QWEN3_CUSTOM_MOE,
+                DecoderBlockType.GEMMA4,
+            ):
+              is_moe = True
+            elif cfg.decoder_block in (DecoderBlockType.LLAMA4, DecoderBlockType.ENVY):
+              is_moe = llama4.determine_is_moe_layer(lyr, self.config.interleave_moe_layer_step)
+
+            if is_moe and forced_routed_experts is not None:
+              if forced_routed_experts.ndim == 4:
+                current_forced_routed_experts = forced_routed_experts[:, :, moe_lyr_idx, :]
+              else:
+                current_forced_routed_experts = forced_routed_experts
+              moe_lyr_idx += 1
+            elif is_moe:
+              moe_lyr_idx += 1
+
+            call_kwargs = {
+                "previous_chunk": previous_chunk,
+                "slot": slot,
+                "kv_cache": kv_cache,
+                "attention_metadata": attention_metadata,
+            }
+            call_kwargs.update(layer_call_kwargs)
+
+            if is_moe and current_forced_routed_experts is not None:
+              call_kwargs["forced_routed_experts"] = current_forced_routed_experts
+
             y, returned_cache = layer(
                 y,
                 decoder_segment_ids,
                 decoder_positions,
                 deterministic,
                 model_mode,
-                previous_chunk=previous_chunk,
-                slot=slot,
-                kv_cache=kv_cache,
-                attention_metadata=attention_metadata,
-                **layer_call_kwargs,
+                **call_kwargs,
             )
             if kv_caches is not None and returned_cache is not None:
               kv_caches[lyr] = returned_cache

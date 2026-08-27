@@ -78,9 +78,10 @@ class _UniformNnxDecoder(nnx.Module):
       enable_dropout=False,
       decoder_target_tokens=None,
       decoder_target_mask=None,
+      forced_routed_experts=None,
   ):
     del decoder_positions, decoder_segment_ids, encoder_images, encoder_image_masks
-    del enable_dropout, decoder_target_tokens, decoder_target_mask
+    del enable_dropout, decoder_target_tokens, decoder_target_mask, forced_routed_experts
     return jnp.zeros((*decoder_input_tokens.shape, self.vocab_size), dtype=jnp.float32)
 
 
@@ -101,9 +102,10 @@ class _UniformLinenDecoder(nn.Module):
       enable_dropout=False,
       decoder_target_tokens=None,
       decoder_target_mask=None,
+      forced_routed_experts=None,
   ):
     del decoder_positions, decoder_segment_ids, encoder_images, encoder_image_masks
-    del enable_dropout, decoder_target_tokens, decoder_target_mask
+    del enable_dropout, decoder_target_tokens, decoder_target_mask, forced_routed_experts
     return jnp.zeros((*decoder_input_tokens.shape, self.vocab_size), dtype=jnp.float32)
 
 

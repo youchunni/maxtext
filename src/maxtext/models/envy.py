@@ -177,6 +177,7 @@ class EnvyDecoderLayer(nnx.Module):
       slot: None | int = None,
       kv_cache=None,
       attention_metadata=None,
+      forced_routed_experts: jnp.ndarray | None = None,
   ):
     cfg = self.config
 
@@ -218,7 +219,7 @@ class EnvyDecoderLayer(nnx.Module):
 
     load_balance_loss = None
     if self.is_moe_layer:
-      mlp_lnx, load_balance_loss, _ = self.moe_block(hidden_states)
+      mlp_lnx, load_balance_loss, _ = self.moe_block(hidden_states, forced_routed_experts=forced_routed_experts)
     else:
       mlp_lnx = self.mlp(hidden_states, deterministic=deterministic)
     if self.config.use_post_ffw_norm:
@@ -305,6 +306,7 @@ class EnvyScannableBlock(nnx.Module):
       slot: None | int = None,
       kv_cache=None,
       attention_metadata=None,
+      forced_routed_experts: jnp.ndarray | None = None,
   ):
     cfg = self.config
 
@@ -316,8 +318,18 @@ class EnvyScannableBlock(nnx.Module):
 
     inputs = checkpoint_name(inputs, "decoder_layer_input")
     y = inputs
+    # forced_routed_experts, when present, is shaped [moe_per_cycle, batch,
+    # seq, top_k]: one slice per MoE sub-layer in this cycle (dense sub-layers
+    # get none), indexed by a running MoE-only counter (see
+    # nnx_decoders.py's scan wiring).
+    moe_idx = 0
     for layer_id in range(cfg.inhomogeneous_layer_cycle_interval):
-      y = getattr(self, f"layers_{layer_id}")(
+      layer = getattr(self, f"layers_{layer_id}")
+      layer_forced_routed_experts = None
+      if forced_routed_experts is not None and layer.is_moe_layer:
+        layer_forced_routed_experts = forced_routed_experts[moe_idx]
+        moe_idx += 1
+      y = layer(
           y,
           decoder_segment_ids,
           decoder_positions,
@@ -327,6 +339,7 @@ class EnvyScannableBlock(nnx.Module):
           slot=slot,
           kv_cache=kv_cache,
           attention_metadata=attention_metadata,
+          forced_routed_experts=layer_forced_routed_experts,
       )
       if cfg.scan_layers:
         y = y[0]
