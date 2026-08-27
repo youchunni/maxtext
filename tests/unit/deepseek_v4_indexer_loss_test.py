@@ -123,7 +123,7 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
     self.assertTrue(hasattr(attn, "indexer_loss"))
     self.assertIsInstance(attn.indexer_loss, indexer_losses)
 
-    loss_val = attn.indexer_loss.value
+    loss_val = attn.indexer_loss.get_value()
     self.assertGreater(float(loss_val), 0.0)
 
   def test_csa_indexer_loss_sparse_training_mode(self):
@@ -148,7 +148,7 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
     self.assertIsNotNone(out)
     self.assertTrue(hasattr(attn, "indexer_loss"))
     self.assertIsInstance(attn.indexer_loss, indexer_losses)
-    self.assertGreater(float(attn.indexer_loss.value), 0.0)
+    self.assertGreater(float(attn.indexer_loss.get_value()), 0.0)
 
   def test_csa_indexer_loss_kl_divergence_zero(self):
     """Test KL divergence is 0 when predicted and target distributions match."""
@@ -217,60 +217,99 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
 
   def test_csa_indexer_gradients_flow(self):
     """Test that gradients flow to indexer parameters and do not leak into main projections or inputs."""
-    config = self._get_config(indexer_loss_scaling_factor=1.0, indexer_sparse_training=False)
-    attn = self._init_csa_attention(config)
+    for is_sparse in (False, True):
+      with self.subTest(indexer_sparse_training=is_sparse):
+        config = self._get_config(indexer_loss_scaling_factor=1.0, indexer_sparse_training=is_sparse)
+        attn = self._init_csa_attention(config)
 
-    inputs_q = jax.random.normal(jax.random.PRNGKey(1), (self.batch_size, self.seq_len, config.emb_dim))
-    inputs_kv = jax.random.normal(jax.random.PRNGKey(2), (self.batch_size, self.seq_len, config.emb_dim))
-    positions = jnp.broadcast_to(jnp.arange(self.seq_len)[None, :], (self.batch_size, self.seq_len))
-    segment_ids = jnp.ones((self.batch_size, self.seq_len), dtype=jnp.int32)
+        inputs_q = jax.random.normal(jax.random.PRNGKey(1), (self.batch_size, self.seq_len, config.emb_dim))
+        inputs_kv = jax.random.normal(jax.random.PRNGKey(2), (self.batch_size, self.seq_len, config.emb_dim))
+        positions = jnp.broadcast_to(jnp.arange(self.seq_len)[None, :], (self.batch_size, self.seq_len))
+        segment_ids = jnp.ones((self.batch_size, self.seq_len), dtype=jnp.int32)
 
-    def loss_fn(attn_model):
-      attn_model(
-          inputs_q=inputs_q,
-          inputs_kv=inputs_kv,
-          decoder_segment_ids=segment_ids,
-          inputs_positions=positions,
-          deterministic=True,
-          model_mode=MODEL_MODE_TRAIN,
-      )
-      return attn_model.indexer_loss.value
+        def loss_fn(attn_model, q, kv):
+          attn_model(
+              inputs_q=q,
+              inputs_kv=kv,
+              decoder_segment_ids=segment_ids,
+              inputs_positions=positions,
+              deterministic=True,
+              model_mode=MODEL_MODE_TRAIN,
+          )
+          return attn_model.indexer_loss.get_value()
 
-    grad_fn = nnx.grad(loss_fn)
-    grads = grad_fn(attn)
+        # 1. Gradients with respect to model parameters (argnums=0)
+        grad_model_fn = nnx.grad(loss_fn, argnums=0)
+        grads = grad_model_fn(attn, inputs_q, inputs_kv)
 
-    # Gradients must flow to indexer projection kernels
-    self.assertIsNotNone(grads.csa_compressor.indexer.q_proj.kernel)
-    self.assertIsNotNone(grads.csa_compressor.indexer.kv_proj.kernel)
-    self.assertIsNotNone(grads.csa_compressor.indexer.gate_proj.kernel)
-    self.assertIsNotNone(grads.csa_compressor.indexer.weights_proj.kernel)
+        # Gradients must flow to indexer projection kernels
+        self.assertIsNotNone(grads.csa_compressor.indexer.q_proj.kernel)
+        self.assertIsNotNone(grads.csa_compressor.indexer.kv_proj.kernel)
+        self.assertIsNotNone(grads.csa_compressor.indexer.gate_proj.kernel)
+        self.assertIsNotNone(grads.csa_compressor.indexer.weights_proj.kernel)
 
-    q_grad_norm = jnp.linalg.norm(grads.csa_compressor.indexer.q_proj.kernel.value)
-    self.assertGreater(float(q_grad_norm), 0.0)
+        q_grad_norm = jnp.linalg.norm(grads.csa_compressor.indexer.q_proj.kernel.get_value())
+        self.assertGreater(float(q_grad_norm), 0.0)
 
-    # Gradients must not leak into main model projections
-    self.assertAlmostEqual(float(jnp.linalg.norm(grads.wq_a.kernel.value)), 0.0)
-    self.assertAlmostEqual(float(jnp.linalg.norm(grads.wq_b.kernel.value)), 0.0)
-    self.assertAlmostEqual(float(jnp.linalg.norm(grads.wkv.kernel.value)), 0.0)
+        # Gradients must not leak into main model projections
+        self.assertAlmostEqual(float(jnp.linalg.norm(grads.wq_a.kernel.get_value())), 0.0)
+        self.assertAlmostEqual(float(jnp.linalg.norm(grads.wq_b.kernel.get_value())), 0.0)
+        self.assertAlmostEqual(float(jnp.linalg.norm(grads.wkv.kernel.get_value())), 0.0)
+
+        # 2. Gradients with respect to inputs (argnums=(1, 2)) must be zero (detached)
+        grad_inputs_fn = nnx.grad(loss_fn, argnums=(1, 2))
+        grad_q, grad_kv = grad_inputs_fn(attn, inputs_q, inputs_kv)
+        self.assertAlmostEqual(float(jnp.linalg.norm(grad_q)), 0.0)
+        self.assertAlmostEqual(float(jnp.linalg.norm(grad_kv)), 0.0)
 
   def test_dense_warmup_forward_mask_is_causal_dense(self):
-    """Test that dense warm-up forward pass executes the dense causal path by comparing against top-k=1 sparse mode."""
+    """Test that dense warm-up forward pass executes the dense causal path by asserting mask values and comparing against top-k=1 sparse mode."""
+    # Case A: Verify scale=0, indexer_sparse_training=False stays dense and produces no indexer loss
+    config_unscaled = self._get_config(indexer_loss_scaling_factor=0.0, indexer_sparse_training=False)
+    attn_unscaled = self._init_csa_attention(config_unscaled)
+
+    inputs_q = jax.random.normal(jax.random.PRNGKey(1), (self.batch_size, self.seq_len, config_unscaled.emb_dim))
+    inputs_kv = jax.random.normal(jax.random.PRNGKey(2), (self.batch_size, self.seq_len, config_unscaled.emb_dim))
+    positions = jnp.broadcast_to(jnp.arange(self.seq_len)[None, :], (self.batch_size, self.seq_len))
+    segment_ids = jnp.ones((self.batch_size, self.seq_len), dtype=jnp.int32)
+    n_windows = self.seq_len // self.compress_ratio
+
+    attn_unscaled(
+        inputs_q=inputs_q,
+        inputs_kv=inputs_kv,
+        decoder_segment_ids=segment_ids,
+        inputs_positions=positions,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
+    # No indexer loss registered when scaling_factor == 0.0
+    self.assertFalse(hasattr(attn_unscaled, "indexer_loss"))
+    self.assertIsNone(getattr(attn_unscaled, "indexer_loss", None))
+
+    # Directly assert the dense causal mask values across block boundaries
+    dense_mask = attn_unscaled.get_compressed_mask(positions, n_windows)
+    self.assertEqual(dense_mask.shape, (self.batch_size, 1, self.seq_len, n_windows))
+    # Token t=0: All 4 blocks are future -> all masked
+    np.testing.assert_allclose(np.array(dense_mask[:, 0, 0, :]), DEFAULT_MASK_VALUE, atol=1e-5)
+    # Token t=3: Block 0 complete (valid 0.0), Blocks 1..3 future (DEFAULT_MASK_VALUE)
+    np.testing.assert_allclose(np.array(dense_mask[:, 0, 3, 0]), 0.0, atol=1e-5)
+    np.testing.assert_allclose(np.array(dense_mask[:, 0, 3, 1:]), DEFAULT_MASK_VALUE, atol=1e-5)
+    # Token t=7: Blocks 0..1 complete (valid 0.0), Blocks 2..3 future (DEFAULT_MASK_VALUE)
+    np.testing.assert_allclose(np.array(dense_mask[:, 0, 7, :2]), 0.0, atol=1e-5)
+    np.testing.assert_allclose(np.array(dense_mask[:, 0, 7, 2:]), DEFAULT_MASK_VALUE, atol=1e-5)
+    # Token t=15: All blocks 0..3 complete -> all 0.0
+    np.testing.assert_allclose(np.array(dense_mask[:, 0, 15, :]), 0.0, atol=1e-5)
+
+    # Case B: Output divergence between dense warm-up and top-1 sparse mode
     config_dense = self._get_config(indexer_loss_scaling_factor=1.0, indexer_sparse_training=False, indexer_topk=1)
     config_sparse = self._get_config(indexer_loss_scaling_factor=1.0, indexer_sparse_training=True, indexer_topk=1)
 
     attn_dense = self._init_csa_attention(config_dense)
     attn_sparse = self._init_csa_attention(config_sparse)
 
-    # Share model parameters between dense and sparse modules
     state_dense = nnx.state(attn_dense)
     nnx.update(attn_sparse, state_dense)
 
-    inputs_q = jax.random.normal(jax.random.PRNGKey(1), (self.batch_size, self.seq_len, config_dense.emb_dim))
-    inputs_kv = jax.random.normal(jax.random.PRNGKey(2), (self.batch_size, self.seq_len, config_dense.emb_dim))
-    positions = jnp.broadcast_to(jnp.arange(self.seq_len)[None, :], (self.batch_size, self.seq_len))
-    segment_ids = jnp.ones((self.batch_size, self.seq_len), dtype=jnp.int32)
-
-    # Run forward pass through both modules
     out_dense, _ = attn_dense(
         inputs_q=inputs_q,
         inputs_kv=inputs_kv,
@@ -288,16 +327,12 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
         model_mode=MODEL_MODE_TRAIN,
     )
 
-    # For query token t=15 (where 4 blocks are valid):
-    # - In dense warm-up, the attention operator attends to all 4 compressed blocks causally.
-    # - In sparse mode with indexer_topk=1, it prunes to only 1 block.
-    # The output representations must differ significantly at t=15 due to dense vs top-1 selection.
     diff_t15 = jnp.linalg.norm(out_dense[:, 15, :] - out_sparse[:, 15, :])
     self.assertGreater(float(diff_t15), 0.05)
 
-    # Loss must be populated in dense warm-up mode
+    # Loss must be populated in dense warm-up mode when scaling_factor > 0.0
     self.assertIsNotNone(attn_dense.indexer_loss)
-    self.assertGreater(float(attn_dense.indexer_loss.value), 0.0)
+    self.assertGreater(float(attn_dense.indexer_loss.get_value()), 0.0)
 
   def test_teacher_causality_and_packing_on_loss_function(self):
     """Test calculate_csa_indexer_loss directly on a 2-segment packed sequence with causal boundaries."""
@@ -385,7 +420,7 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
           deterministic=True,
           model_mode=MODEL_MODE_TRAIN,
       )
-      return out, attn_model.indexer_loss.value
+      return out, attn_model.indexer_loss.get_value()
 
     out, loss_val = jitted_forward(attn, inputs_q, inputs_kv, segment_ids, positions)
     self.assertEqual(out.shape, (self.batch_size, self.seq_len, config.emb_dim))

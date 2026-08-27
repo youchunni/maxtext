@@ -1598,11 +1598,11 @@ class CompressedAttention(Attention):
           inputs_kv, q_normed, inputs_positions, model_mode, self.compressor_cache
       )
     elif self.compress_ratio == 4:
-      if (
-          getattr(self.config, "use_indexer", False)
-          and getattr(self.config, "indexer_loss_scaling_factor", 0.0) > 0.0
-          and model_mode == MODEL_MODE_TRAIN
-      ):
+      use_indexer = getattr(self.config, "use_indexer", False)
+      scaling_factor = getattr(self.config, "indexer_loss_scaling_factor", 0.0)
+      should_compute_loss = use_indexer and scaling_factor > 0.0 and model_mode == MODEL_MODE_TRAIN
+
+      if use_indexer:
         compressed_kv, sparse_compressed_mask, indexer_scores = self.csa_compressor(
             inputs_kv,
             q_normed,
@@ -1613,7 +1613,19 @@ class CompressedAttention(Attention):
             self.indexer_cache,
             return_indexer_scores=True,
         )
-        if indexer_scores is not None and compressed_kv is not None and compressed_kv.shape[1] > 0:
+        is_sparse_training = getattr(self.config, "indexer_sparse_training", False)
+        compressed_mask = self.get_compressed_mask(
+            inputs_positions,
+            compressed_kv.shape[1],
+            sparse_compressed_mask=sparse_compressed_mask if is_sparse_training else None,
+        )
+
+        if (
+            should_compute_loss
+            and indexer_scores is not None
+            and compressed_kv is not None
+            and compressed_kv.shape[1] > 0
+        ):
           indexer_loss = self.calculate_csa_indexer_loss(
               indexer_score=indexer_scores,
               query=q,
@@ -1621,21 +1633,10 @@ class CompressedAttention(Attention):
               compressed_mask=sparse_compressed_mask,
               segment_mask=compressed_segment_mask,
               position_ids=inputs_positions,
-              sparse_loss=getattr(self.config, "indexer_sparse_training", False),
-              scaling_factor=self.config.indexer_loss_scaling_factor,
+              sparse_loss=is_sparse_training,
+              scaling_factor=scaling_factor,
           )
           self.indexer_loss = indexer_losses(indexer_loss)
-
-        # In Dense Warm-up stage (not indexer_sparse_training), the main attention forward pass
-        # must remain DENSE over all causally valid blocks (no top-k block pruning). In sparse training stage, use the sparse top-k mask.
-        if getattr(self.config, "indexer_sparse_training", False):
-          compressed_mask = sparse_compressed_mask
-        else:
-          usable_len = compressed_kv.shape[1] * self.compress_ratio
-          block_positions = inputs_positions[:, :usable_len:self.compress_ratio]
-          is_future = (block_positions[:, None, :] + self.compress_ratio) > (inputs_positions[:, :, None] + 1)
-          dense_causal_mask = jnp.where(is_future, DEFAULT_MASK_VALUE, 0.0).astype(self.dtype)
-          compressed_mask = dense_causal_mask[:, None, :, :]
       else:
         compressed_kv, compressed_mask = self.csa_compressor(
             inputs_kv,
@@ -1744,6 +1745,21 @@ class CompressedAttention(Attention):
 
     # Return the Tuple expected by the transformer block
     return final_out, current_kv_cache
+
+  def get_compressed_mask(
+      self,
+      inputs_positions: Array,
+      compressed_len: int,
+      sparse_compressed_mask: Optional[Array] = None,
+  ) -> Array:
+    """Builds compressed attention mask. Returns sparse_compressed_mask if provided, else dense causal mask."""
+    if sparse_compressed_mask is not None:
+      return sparse_compressed_mask
+    usable_len = compressed_len * self.compress_ratio
+    block_positions = inputs_positions[:, :usable_len:self.compress_ratio]
+    is_future = (block_positions[:, None, :] + self.compress_ratio) > (inputs_positions[:, :, None] + 1)
+    dense_causal_mask = jnp.where(is_future, DEFAULT_MASK_VALUE, 0.0).astype(self.dtype)
+    return dense_causal_mask[:, None, :, :]
 
   def calculate_csa_indexer_loss(
       self,

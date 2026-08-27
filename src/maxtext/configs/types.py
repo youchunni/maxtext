@@ -716,9 +716,9 @@ class CompressedAttention(BaseModel):
 
 
 class AttentionIndexer(BaseModel):
-  """Configuration for DeepSeek Sparse Attention (DSA): DeepSeek3.2-style MLA with indexer."""
+  """Configuration for DeepSeek Sparse Attention (DSA): MLA or Compressed Attention with indexer."""
 
-  use_indexer: bool = Field(False, description="Whether to use sparse indexer for MLA.")
+  use_indexer: bool = Field(False, description="Whether to use sparse indexer for MLA or Compressed Attention.")
   indexer_head_dim: NonNegativeInt = Field(128, description="Head dim for indexer query and key.")
   indexer_n_heads: NonNegativeInt = Field(64, description="Number of query heads in indexer.")
   indexer_topk: NonNegativeInt = Field(2048, description="Number of tokens selected by the query token in indexer.")
