@@ -74,6 +74,13 @@ from tunix.rl.grpo.grpo_learner import GrpoConfig, GrpoLearner
 from tunix.sft import metrics_logger, profiler
 import tunix.generate.utils as tunix_utils
 
+# Monkey-patch tunix to track 'wo' in its internal MoE weights registry.
+# This prevents Tunix from crashing with ShapeMismatchError when MoE configs
+# are internally padded by MaxText for GMM_v2.
+if not hasattr(tunix_utils, "_original_moe_weights"):
+  tunix_utils._original_moe_weights = tunix_utils._MOE_MLP_WEIGHTS
+  tunix_utils._MOE_MLP_WEIGHTS = frozenset([*tunix_utils._MOE_MLP_WEIGHTS, "wo"])
+
 
 @contextlib.contextmanager
 def _tpu_inference_compat_patches():
