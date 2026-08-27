@@ -29,27 +29,7 @@ from maxtext.utils import lora_utils
 from maxtext.utils import max_logging
 from maxtext.utils import model_creation_utils
 from maxtext.utils.globals import MAXTEXT_CONFIGS_DIR
-from maxtext.layers.embeddings import Embed
-
-# Class-level patch for Embed to support dynamic inputs_embeds override
-original_embed_call = Embed.__call__
-
-
-def patched_embed_call(self, x, model_mode=None):
-  """Uses active input embeddings when the vLLM multimodal path enables them."""
-  if hasattr(self, "use_inputs_embeds") and x.ndim == 2:
-
-    def true_fn():
-      return jnp.broadcast_to(self.active_inputs_embeds[...], (x.shape[0], 1, self.active_inputs_embeds.shape[-1]))
-
-    def false_fn():
-      return original_embed_call(self, x, model_mode=model_mode)
-
-    return jax.lax.cond(self.use_inputs_embeds[...], true_fn, false_fn)
-  return original_embed_call(self, x, model_mode=model_mode)
-
-
-Embed.__call__ = patched_embed_call
+from tpu_inference.models.jax.utils.multi_modal_utils import merge_multimodal_embeddings
 
 
 try:
@@ -58,12 +38,6 @@ except ImportError:
   # Mock for documentation build or environments without tpu_inference
   class AttentionMetadata:
     input_positions: jax.Array
-
-
-try:
-  from tpu_inference.models.jax.utils.multi_modal_utils import merge_multimodal_embeddings
-except ImportError:
-  merge_multimodal_embeddings = None
 
 
 from vllm.config import VllmConfig
@@ -286,31 +260,13 @@ class MaxTextForCausalLM(nnx.Module):
         attention_metadata_picked = next(iter(attention_metadata.values()))
       attention_metadata = attention_metadata_picked
 
-    # Extract inputs_embeds if passed as positional arg (index 3 in model_fn, so args[0] here)
     inputs_embeds = args[0] if len(args) > 0 else None
-
-    # Handle dummy inputs for multimodal path when inputs_embeds is provided
-    if input_ids is None and inputs_embeds is not None:
-      num_tokens = inputs_embeds.shape[0]
-      # Construct dummy input_ids of shape (num_tokens, 1)
-      input_ids = jnp.zeros((num_tokens, 1), dtype=jnp.int32)
-
-      # Reshape inputs_embeds to (num_tokens, 1, dim) and cast to model dtype
-      inputs_embeds_3d = jnp.expand_dims(inputs_embeds, axis=1).astype(self.maxtext_config.dtype)
-
-      if hasattr(self.model, "token_embedder"):
-        # Recreate the variable to change its shape dynamically
-        self.model.token_embedder.active_inputs_embeds = nnx.Variable(inputs_embeds_3d)
-        self.model.token_embedder.use_inputs_embeds[...] = True
+    if inputs_embeds is not None:
+      input_ids = jnp.zeros((inputs_embeds.shape[0], 1), dtype=jnp.int32)
+      decoder_input_embeddings = inputs_embeds[:, None, :].astype(self.maxtext_config.dtype)
     else:
-      # Ensure inputs are at least 2D with a batch dimension
-      input_ids = jnp.expand_dims(input_ids, axis=1)
-      if hasattr(self.model, "token_embedder") and hasattr(self.model.token_embedder, "use_inputs_embeds"):
-        self.model.token_embedder.use_inputs_embeds[...] = False
-        # Reset shape to (1, 1, dim) to avoid broadcasting errors in JIT tracing of unused branch
-        self.model.token_embedder.active_inputs_embeds = nnx.Variable(
-            jnp.zeros((1, 1, self.maxtext_config.emb_dim), dtype=self.maxtext_config.dtype)
-        )
+      input_ids = input_ids[:, None]
+      decoder_input_embeddings = None
 
     # MaxText decode treats vLLM's flattened positions as a batch with
     # seq_len=1. MRoPE positions arrive channel-first and must also move their
@@ -322,6 +278,7 @@ class MaxTextForCausalLM(nnx.Module):
       expert_indices = None
       hidden, kv_caches = self.model(
           decoder_input_tokens=input_ids,
+          decoder_input_embeddings=decoder_input_embeddings,
           decoder_positions=input_positions,
           kv_caches=kv_caches,
           attention_metadata=attention_metadata,
@@ -363,8 +320,8 @@ class MaxTextForCausalLM(nnx.Module):
     if not isinstance(self.model, nnx.Module):
       raise ValueError("Model is not initialized.")
 
-    pixel_values = kwargs.get("pixel_values", None)
-    image_grid_thw = kwargs.get("image_grid_thw", None)
+    pixel_values = kwargs.get("pixel_values")
+    image_grid_thw = kwargs.get("image_grid_thw")
 
     if pixel_values is None or image_grid_thw is None:
       return []
@@ -421,20 +378,11 @@ class MaxTextForCausalLM(nnx.Module):
       inputs_embeds = self.model.token_embedder(input_ids)
 
       if multimodal_embeddings is not None:
-        if merge_multimodal_embeddings is None:
-          raise ImportError("tpu_inference multimodal utilities are required to merge multimodal embeddings.")
-
-        placeholder_ids = []
-        if hasattr(self.cfg.hf_config, "image_token_id"):
-          placeholder_ids.append(self.cfg.hf_config.image_token_id)
-        if hasattr(self.cfg.hf_config, "video_token_id"):
-          placeholder_ids.append(self.cfg.hf_config.video_token_id)
-
-        if not placeholder_ids:
-          max_logging.log(
-              "Warning: No image_token_id or video_token_id found in hf_config. Cannot merge multimodal embeddings."
-          )
-          return inputs_embeds
+        placeholder_ids = [
+            token_id
+            for name in ("image_token_id", "video_token_id")
+            if (token_id := getattr(self.cfg.hf_config, name, None)) is not None
+        ]
 
         inputs_embeds = merge_multimodal_embeddings(
             input_ids,
@@ -484,11 +432,6 @@ class MaxTextForCausalLM(nnx.Module):
         if self.maxtext_config.lora.lora_restore_path:
           lora_utils.restore_lora_from_path(model, self.maxtext_config)
       self.model = nnx.data(model)
-      if hasattr(self.model, "token_embedder"):
-        self.model.token_embedder.active_inputs_embeds = nnx.Variable(
-            jnp.zeros((1, 1, self.maxtext_config.emb_dim), dtype=self.maxtext_config.dtype)
-        )
-        self.model.token_embedder.use_inputs_embeds = nnx.Variable(jnp.array(False))
 
   def get_mrope_input_positions(
       self,

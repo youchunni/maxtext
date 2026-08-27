@@ -30,7 +30,7 @@ def register(config=None):
   it leverages vLLM logging to report its status.
   """
   model_name = os.environ.get("MAXTEXT_MODEL_NAME")
-  if config:
+  if config is not None:
     model_name = config.model_name
     os.environ["MAXTEXT_MODEL_NAME"] = model_name
 
@@ -47,21 +47,17 @@ def register(config=None):
   patch_kv_cache_manager()
 
   if model_name and model_name.startswith("qwen3-vl"):
-    try:
-      from vllm.multimodal import MULTIMODAL_REGISTRY
-      from vllm.model_executor.models.qwen3_vl import (
-          Qwen3VLMultiModalProcessor,
-          Qwen3VLProcessingInfo,
-          Qwen3VLDummyInputsBuilder,
-      )
+    from vllm.multimodal import MULTIMODAL_REGISTRY
+    from vllm.model_executor.models.qwen3_vl import (
+        Qwen3VLDummyInputsBuilder,
+        Qwen3VLMultiModalProcessor,
+        Qwen3VLProcessingInfo,
+    )
 
-      logger.info("Registering Qwen3VLMultiModalProcessor for MaxTextForCausalLM.")
-      MULTIMODAL_REGISTRY.register_processor(
-          Qwen3VLMultiModalProcessor,
-          info=Qwen3VLProcessingInfo,
-          dummy_inputs=Qwen3VLDummyInputsBuilder,
-      )(MaxTextForCausalLM)
-    except ImportError as e:
-      logger.warning("Failed to register Qwen3VLMultiModalProcessor: %s", e)
+    MULTIMODAL_REGISTRY.register_processor(
+        Qwen3VLMultiModalProcessor,
+        info=Qwen3VLProcessingInfo,
+        dummy_inputs=Qwen3VLDummyInputsBuilder,
+    )(MaxTextForCausalLM)
 
   logger.info("Successfully registered MaxTextForCausalLM model.")

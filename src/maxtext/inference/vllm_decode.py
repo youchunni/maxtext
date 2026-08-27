@@ -58,16 +58,14 @@ from vllm.config import ModelConfig
 from vllm.sampling_params import SamplingParams
 
 _USE_MROPE = False
-original_uses_mrope_getter = ModelConfig.uses_mrope.fget
+_ORIGINAL_USES_MROPE = ModelConfig.uses_mrope.fget
 
 
-def custom_uses_mrope(self):
-  if _USE_MROPE:
-    return original_uses_mrope_getter(self)
-  return False
+def _uses_mrope(self):
+  return _ORIGINAL_USES_MROPE(self) if _USE_MROPE else False
 
 
-ModelConfig.uses_mrope = property(custom_uses_mrope)
+ModelConfig.uses_mrope = property(_uses_mrope)
 
 # --- DEFINE FLAGS GLOBALLY ---
 FLAGS = flags.FLAGS
@@ -83,11 +81,7 @@ def build_chat_messages(config: Config) -> list[dict[str, Any]]:
     messages.append({"role": "system", "content": config.system_prompt})
 
   if config.use_multimodal:
-    content = []
-    if config.image_path:
-      image_paths = config.image_path.split(",")
-      for _ in image_paths:
-        content.append({"type": "image"})
+    content = [{"type": "image"} for _ in config.image_path.split(",")]
     content.append({"type": "text", "text": config.prompt})
     messages.append({"role": "user", "content": content})
   else:
@@ -101,6 +95,9 @@ def decode_with_vllm(config: Config) -> None:
   Args:
     config: MaxText config.
   """
+  if config.use_multimodal and not config.image_path:
+    raise ValueError("image_path must be provided when use_multimodal is True")
+
   # Prepare vLLM Arguments
   vllm_args = {
       "model": config.tokenizer_path,
@@ -161,53 +158,29 @@ def decode_with_vllm(config: Config) -> None:
   with nn_partitioning.axis_rules(vllm_config.logical_axis_rules):
     llm = LLM(**vllm_args)
 
-  max_logging.log(f"Jetski: model_config.is_multimodal_model = {llm.model_config.is_multimodal_model}")
-  architecture = getattr(llm.model_config, "_architecture", None)
-  model_info = getattr(llm.model_config, "_model_info", None)
-  max_logging.log(f"Jetski: model_config._architecture = {architecture}")
-  max_logging.log(f"Jetski: model_config._model_info = {model_info}")
-  max_logging.log(
-      f"Jetski: model_config._model_info.supports_multimodal = {getattr(model_info, 'supports_multimodal', None)}"
-  )
-
   max_logging.log("Generating output...")
   tokenizer = transformers.AutoTokenizer.from_pretrained(
       config.tokenizer_path,
       token=config.hf_access_token,
   )
 
-  prompts = [config.prompt]
+  prompt = config.prompt
   if config.use_chat_template:
-    # Format the prompt using chat template if specified
-    input_with_chat_template = tokenizer.apply_chat_template(
+    prompt = tokenizer.apply_chat_template(
         build_chat_messages(config),
-        tokenize=False,  # Set to False to get the string
+        tokenize=False,
         add_generation_prompt=True,
-        add_special_tokens=False,  # Prevent adding special tokens
+        add_special_tokens=False,
     )
-    prompts = [input_with_chat_template]
+
+  max_prompt_length = len(tokenizer.encode(prompt))
 
   if config.use_multimodal:
-    if not config.image_path:
-      raise ValueError("image_path must be provided when use_multimodal is True")
-    image_paths = config.image_path.split(",")
-    images = [Image.open(p) for p in image_paths]
-    if len(images) == 1:
-      multimodal_data = {"image": images[0]}
-    else:
-      multimodal_data = {"image": images}
-    prompts = [
-        {
-            "prompt": p,
-            "multi_modal_data": multimodal_data,
-        }
-        for p in prompts
-    ]
-
-  def get_prompt_str(p):
-    return p["prompt"] if isinstance(p, dict) else p
-
-  max_prompt_length = max(len(tokenizer.encode(get_prompt_str(p))) for p in prompts)
+    images = [Image.open(path.strip()) for path in config.image_path.split(",")]
+    image_data = images[0] if len(images) == 1 else images
+    prompts = [{"prompt": prompt, "multi_modal_data": {"image": image_data}}]
+  else:
+    prompts = [prompt]
   max_tokens_to_generate = config.max_target_length - max_prompt_length
   if max_tokens_to_generate <= 0:
     raise ValueError(

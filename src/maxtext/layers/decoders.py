@@ -689,11 +689,16 @@ class Decoder(nn.Module):
       deterministic,
       model_mode,
       multimodal_input=None,
+      decoder_input_embeddings=None,
   ):
     """Applies token and positional embeddings to the input tokens."""
     cfg = self.config
 
-    y = shared_embedding(decoder_input_tokens.astype("int32"), model_mode=model_mode)
+    y = (
+        decoder_input_embeddings
+        if decoder_input_embeddings is not None
+        else shared_embedding(decoder_input_tokens.astype("int32"), model_mode=model_mode)
+    )
 
     # Merge the image embeddings with the text embeddings for multimodal models
     if multimodal_input is not None:
@@ -862,6 +867,7 @@ class Decoder(nn.Module):
       kv_caches: list[jax.Array] | None = None,
       attention_metadata=None,
       deepstack_visual_embeds: None | list[jnp.ndarray] = None,
+      decoder_input_embeddings=None,
   ):
     cfg = self.config
     mesh = self.mesh
@@ -875,6 +881,7 @@ class Decoder(nn.Module):
         deterministic,
         model_mode,
         multimodal_input=multimodal_input,
+        decoder_input_embeddings=decoder_input_embeddings,
     )
 
     mhc_expand, mhc_reduce = mhc.get_functions(cfg.mhc_expansion_rate)
