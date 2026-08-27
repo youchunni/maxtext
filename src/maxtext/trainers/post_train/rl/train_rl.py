@@ -74,14 +74,6 @@ from tunix.rl.grpo.grpo_learner import GrpoConfig, GrpoLearner
 from tunix.sft import metrics_logger, profiler
 import tunix.generate.utils as tunix_utils
 
-# Monkey-patch tunix to track 'wo' in its internal MoE weights registry.
-# This prevents Tunix from crashing with ShapeMismatchError when MoE configs
-# are internally padded by MaxText for GMM_v2.
-if not hasattr(tunix_utils, "_original_moe_weights"):
-  tunix_utils._original_moe_weights = tunix_utils._MOE_MLP_WEIGHTS
-  tunix_utils._MOE_MLP_WEIGHTS = frozenset([*tunix_utils._MOE_MLP_WEIGHTS, "wo"])
-
-
 @contextlib.contextmanager
 def _tpu_inference_compat_patches():
   """Tactical compat shims for tpu_inference.
@@ -103,6 +95,8 @@ def _tpu_inference_compat_patches():
   orig_apply_dtype_cast = tunix_utils._apply_dtype_cast  # pylint: disable=protected-access
   orig_bulk = tunix_utils._bulk_align_and_unstack  # pylint: disable=protected-access
   orig_unstack = tunix_utils._unstack_scanned_param  # pylint: disable=protected-access
+  
+  orig_moe_weights = getattr(tunix_utils, "_MOE_MLP_WEIGHTS", None)
 
   def _compat_wsc(x, shardings):
     try:
@@ -132,6 +126,10 @@ def _tpu_inference_compat_patches():
   tunix_utils._apply_dtype_cast = _no_bf16_to_f32_cast  # pylint: disable=protected-access
   tunix_utils._bulk_align_and_unstack = _compat_bulk  # pylint: disable=protected-access
   tunix_utils._unstack_scanned_param = _compat_unstack  # pylint: disable=protected-access
+  
+  if orig_moe_weights is not None:
+    tunix_utils._MOE_MLP_WEIGHTS = frozenset([*orig_moe_weights, 'wo'])  # pylint: disable=protected-access
+
   try:
     yield
   finally:
@@ -139,7 +137,8 @@ def _tpu_inference_compat_patches():
     tunix_utils._apply_dtype_cast = orig_apply_dtype_cast  # pylint: disable=protected-access
     tunix_utils._bulk_align_and_unstack = orig_bulk  # pylint: disable=protected-access
     tunix_utils._unstack_scanned_param = orig_unstack  # pylint: disable=protected-access
-
+    if orig_moe_weights is not None:
+      tunix_utils._MOE_MLP_WEIGHTS = orig_moe_weights  # pylint: disable=protected-access
 
 os.environ["TOKENIZERS_PARALLELISM"] = "0"
 
@@ -660,192 +659,4 @@ def create_rl_components(  # pylint: disable=too-many-positional-arguments
 
 
 def configure_tokenizer_chat_template(model_tokenizer: Any, trainer_config: Any) -> None:
-  """Populates the tokenizer's chat_template from config if missing."""
-  if getattr(model_tokenizer, "chat_template", None) is None:
-    if getattr(trainer_config, "chat_template", None):
-      model_tokenizer.chat_template = trainer_config.chat_template
-    elif getattr(trainer_config, "chat_template_path", None):
-      from maxtext.input_pipeline.instruction_data_processing import (  # pylint: disable=import-outside-toplevel
-          load_chat_template_from_file,
-      )
-
-      model_tokenizer.chat_template = load_chat_template_from_file(trainer_config.chat_template_path)
-    else:
-      raise ValueError(
-          f"Tokenizer {getattr(trainer_config, 'tokenizer_path', None)!r} has no chat_template "
-          "and config.chat_template / config.chat_template_path "
-          "are both empty. Either pick an instruction-tuned tokenizer that "
-          "ships with a chat_template, set config.chat_template to a Jinja "
-          "string, or set config.chat_template_path to a JSON file "
-          "with a 'chat_template' key."
-      )
-
-
-def rl_train(argv: Sequence[str], kwargs: dict):
-  """
-  Run RL training with the provided configuration.
-
-  Args:
-    trainer_config: MaxText configuration for the trainer.
-    sampler_config: MaxText configuration for the sampler.
-    trainer_devices: JAX devices for the trainer.
-    sampler_devices: JAX devices for the sampler.
-  """
-  with _tpu_inference_compat_patches():
-    _rl_train_impl(argv, kwargs)
-
-
-def _rl_train_impl(argv: Sequence[str], kwargs: dict):
-  """rl_train body — kept separate so _tpu_inference_compat_patches wraps it cleanly."""
-  trainer_config, sampler_config, trainer_devices, sampler_devices = model_creation_utils.setup_configs_and_devices(
-      argv,
-      kwargs,
-      config_class=types.RLConfig,
-  )
-
-  # Create model tokenizer first so we can plumb its pad_id into the model
-  # adapter (used to synthesize segment_ids that mask pad positions from
-  # attention — without this the trainer attends to pad tokens and produces
-  # corrupted log-probs).
-  model_tokenizer = AutoTokenizer.from_pretrained(
-      trainer_config.tokenizer_path,
-      token=trainer_config.hf_access_token or None,
-  )
-  configure_tokenizer_chat_template(model_tokenizer, trainer_config)
-
-  reference_model, reference_mesh, actor_model, actor_mesh, rollout_mesh = model_creation_utils.create_models_and_meshes(
-      trainer_config,
-      sampler_config,
-      trainer_devices,
-      sampler_devices,
-      tokenizer_pad_id=model_tokenizer.pad_token_id,
-  )
-
-  if not trainer_config.debug:
-    # Apply filter to suppress noisy logs
-    noise_filter = max_logging.NoisyLogFilter()
-    logging.getLogger().addFilter(noise_filter)
-    absl_logging.get_absl_logger().addFilter(noise_filter)
-    os.environ["VLLM_LOGGING_LEVEL"] = "ERROR"
-
-  if not epath.Path(trainer_config.tensorboard_dir).exists():
-    epath.Path(trainer_config.tensorboard_dir).mkdir(parents=True, exist_ok=True)
-
-  if not epath.Path(trainer_config.checkpoint_dir).exists():
-    epath.Path(trainer_config.checkpoint_dir).mkdir(parents=True)
-
-  train_dataset, test_dataset = prepare_datasets(trainer_config, model_tokenizer)
-
-  if trainer_config.debug:
-    max_logging.log("Train dataset samples:")
-    for i, ele in enumerate(train_dataset):
-      if i >= 5:
-        break
-      pprint(ele)
-    if trainer_config.num_test_batches > 0:
-      max_logging.log("Test dataset samples:")
-      for i, ele in enumerate(test_dataset):
-        if i >= 5:
-          break
-        pprint(ele)
-
-  if trainer_config.debug:
-    max_logging.log("Reference Model initialized successfully")
-    nnx.display(reference_model)
-    max_logging.log(f"Reference mesh shape: {reference_mesh.shape}")
-    max_logging.log("Policy Model initialized successfully")
-    nnx.display(actor_model)
-    max_logging.log(f"Policy mesh shape: {actor_mesh.shape}")
-    max_logging.log(f"Rollout_mesh shape: {rollout_mesh.shape}")
-
-  rl_cluster, rl_trainer, _, reward_fns = create_rl_components(
-      trainer_config,
-      sampler_config,
-      sampler_devices,
-      actor_model,
-      actor_mesh,
-      reference_model,
-      reference_mesh,
-      rollout_mesh,
-      model_tokenizer,
-  )
-
-  # Run evaluation before training
-  if trainer_config.num_test_batches > 0:
-    # Explicitly sync actor model weights to the rollout engine before Pre-RL evaluation.
-    # When resuming from an RL checkpoint (step > 0), the trainer restores RL checkpoint
-    # weights into actor_model after RLCluster initializes. Without this explicit sync,
-    # the rollout engine would evaluate using the base HuggingFace/SFT weights instead of
-    # the restored RL checkpoint weights. Calling this unconditionally ensures weight sync
-    # robustness across all initialization and restore workflows.
-    rl_cluster.rollout.update_params(nnx.state(actor_model, nnx.Param))
-
-    (corr, total, accuracy, partial_accuracy, format_accuracy, mean_reward), _ = evaluate(
-        trainer_config,
-        test_dataset,
-        rl_cluster=rl_cluster,
-        num_passes=trainer_config.num_eval_passes,
-        corr_lst=trainer_config.eval_corr_lst,
-        make_lst=trainer_config.eval_make_lst,
-        reward_fns=reward_fns,
-    )
-    max_logging.warning(
-        f"Pre RL Training: {corr=}, {total=}, {accuracy=}%, {partial_accuracy=}%,"
-        f" {format_accuracy=}%, {mean_reward=:.4f}"
-    )
-
-  # Start training
-  if trainer_config.load_checkpoint_only_once:
-    max_logging.log("Capturing reference model state before training.")
-    ref_state_before = nnx.to_pure_dict(nnx.state(reference_model.base, nnx.Param))
-
-  # Wire intermediate eval: fire greedy `evaluate(...)` every `eval_interval`
-  # outer steps. No-op when eval_interval <= 0 or num_test_batches <= 0.
-  utils_rl.install_training_hooks(rl_cluster, trainer_config, test_dataset, reward_fns)
-
-  max_logging.warning("Starting RL training...")
-  rl_trainer.train(train_dataset)
-
-  if trainer_config.load_checkpoint_only_once:
-    max_logging.log("Checking if reference model state changed during training.")
-    ref_state_after = nnx.to_pure_dict(nnx.state(reference_model.base, nnx.Param))
-    check = jax.tree_util.tree_map(jax.numpy.array_equal, ref_state_before, ref_state_after)
-    if not jax.tree_util.tree_all(check):
-      raise ValueError("Reference model parameters changed during training!")
-    max_logging.log("Reference model parameters verified to be unchanged during training.")
-
-  max_logging.warning("RL Training Completed Successfully!")
-
-  # Run evaluation after training
-  if trainer_config.num_test_batches > 0:
-    (corr, total, accuracy, partial_accuracy, format_accuracy, mean_reward), _ = evaluate(
-        trainer_config,
-        test_dataset,
-        rl_cluster=rl_cluster,
-        num_passes=trainer_config.num_eval_passes,
-        corr_lst=trainer_config.eval_corr_lst,
-        make_lst=trainer_config.eval_make_lst,
-        reward_fns=reward_fns,
-    )
-    max_logging.warning(
-        f"Post RL Training: {corr=}, {total=}, {accuracy=}%, {partial_accuracy=}%,"
-        f" {format_accuracy=}%, {mean_reward=:.4f}"
-    )
-
-
-def main(argv: Sequence[str], kwargs: dict = None) -> None:
-  """Main function to run RL training.
-
-  Args:
-    argv: Command-line arguments.
-  """
-  kwargs = kwargs or {}
-  pathwaysutils.initialize()
-  os.environ["TF_CPP_MIN_LOG_LEVEL"] = "0"
-
-  max_utils.print_system_information()
-  rl_train(argv, kwargs)
-
-
-if __name__ == "__main__":
-  app.run(main)
+  """Populates the tokenizer's chat_
