@@ -128,6 +128,7 @@ from maxtext.integration.vllm.torchax_converter.qwen35_moe import Qwen35MaxTextT
 from maxtext.integration.vllm.weight_converter import WeightConverter, MODEL_TO_CONVERSION_RULES
 from maxtext.configs import types
 from maxtext.utils import model_creation_utils
+from maxtext.utils.model_creation_utils import get_rollout_kwargs_for_parallelism
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
@@ -362,6 +363,7 @@ def _reshard_and_assign_converted(maxtext_vllm_state, golden_llm_state, llm):
 
   src_flat = traverse_util.flatten_dict(maxtext_vllm_state)
   spec_flat = traverse_util.flatten_dict(state_dict)
+  src_flat = {k: v for k, v in src_flat.items() if k in spec_flat}
 
   resharded_flat = tunix_utils._reshard_in_chunks(  # pylint: disable=protected-access
       src_flat,
@@ -370,21 +372,37 @@ def _reshard_and_assign_converted(maxtext_vllm_state, golden_llm_state, llm):
       chunk_size=16,
       delete_spec_buffers=True,
   )
-  resharded_weights = traverse_util.unflatten_dict(resharded_flat)
 
-  if isinstance(golden_llm_state, nnx.State):
-    nnx.update(golden_llm_state, resharded_weights)
-  elif hasattr(golden_llm_state, "update"):
-    golden_llm_state.update(resharded_weights)
-  elif isinstance(golden_llm_state, dict):
-    golden_llm_state.update(resharded_weights)
+  if isinstance(golden_llm_state, nnx.State) and hasattr(golden_llm_state, "flat_state"):
+    # Mutate VariableState.value directly via flat_state() to preserve PyTreeDef structure
+    for path, var in golden_llm_state.flat_state():
+      val = resharded_flat.get(path + ("value",))
+      if val is None:
+        val = resharded_flat.get(path)
+      if val is not None:
+        if hasattr(var, "set_value"):
+          var.set_value(val)
+        elif hasattr(var, "value"):
+          var.value = val
+        else:
+          try:
+            var[...] = val
+          except Exception:
+            var.value = val
   else:
-    llm.llm_engine.model_executor.driver_worker.model_runner.model.state = resharded_weights
+    resharded_weights = traverse_util.unflatten_dict(resharded_flat)
+    if hasattr(golden_llm_state, "update"):
+      golden_llm_state.update(resharded_weights)
+    elif isinstance(golden_llm_state, dict):
+      golden_llm_state.update(resharded_weights)
+    else:
+      llm.llm_engine.model_executor.driver_worker.model_runner.model.state = resharded_weights
   return golden_llm_state
 
 
 def _sync_model_runner_state(llm, golden_llm_state) -> None:
   """Syncs the updated golden_llm_state into the model runner's model and leaves."""
+  del golden_llm_state  # State is updated in-place via model_runner.state
   model_runner = getattr(
       getattr(
           getattr(getattr(llm, "llm_engine", None), "model_executor", None),
@@ -396,8 +414,6 @@ def _sync_model_runner_state(llm, golden_llm_state) -> None:
   )
   if model_runner is None:
     return
-  if hasattr(model_runner, "model") and isinstance(golden_llm_state, nnx.State):
-    nnx.update(model_runner.model, golden_llm_state)
   if hasattr(model_runner, "state"):
     if isinstance(model_runner.state, nnx.State):
       model_runner.state_leaves = tuple(jax.tree_util.tree_leaves(model_runner.state))
@@ -614,28 +630,6 @@ def validate_converter(argv) -> None:
   gcs_debug_path = getattr(trainer_config, "gcs_debug_path", "")
   benchmark_weight_sync = getattr(trainer_config, "benchmark_weight_sync", False)
 
-  if len(trainer_devices) > sampler_config.rollout_tensor_parallelism:
-    target_dev_count = sampler_config.rollout_tensor_parallelism
-    # Group devices by host / task so subslice bounds align with host bounds (e.g. 2,2,1)
-    by_host = collections.defaultdict(list)
-    for d in trainer_devices:
-      task = getattr(d, "logical_task", getattr(d, "task_id", getattr(d, "host_id", 0)))
-      by_host[task].append(d)
-
-    selected_devices = []
-    for host_devs in by_host.values():
-      selected_devices.extend(host_devs)
-      if len(selected_devices) >= target_dev_count:
-        break
-    trainer_devices = selected_devices[:target_dev_count]
-    sampler_devices = selected_devices[:target_dev_count]
-    logging.info(
-        "Clipping devices to rollout_tensor_parallelism=%d on host %s: %s",
-        target_dev_count,
-        getattr(trainer_devices[0], "logical_task", "unknown"),
-        trainer_devices,
-    )
-
   multislice = trainer_devices is not sampler_devices
 
   logging.info("Creating MaxText model with %d devices...", len(trainer_devices))
@@ -665,17 +659,21 @@ def validate_converter(argv) -> None:
   # load_format="dummy" skips loading real weights — converted MaxText weights
   # are assigned afterwards.  Pass vllm_load_format=auto to load an HF checkpoint
   # for reference stats comparison before assignment.
-  dp_size = (
-      sampler_config.rollout_data_parallelism
-      if sampler_config.rollout_data_parallelism > 0
-      else max(1, len(sampler_devices) // sampler_config.rollout_tensor_parallelism)
-  )
+  #
+  # Resolve tensor/data/expert parallelism together (not just tensor/data) so that
+  # whatever device budget is left over after tensor_parallel_size (e.g. because TP
+  # is capped below the KV-head count) gets spent as expert_parallel_size -- sharding
+  # MoE experts across those chips -- instead of silently falling back to plain
+  # data_parallel_size, which replicates the entire model (all experts included) once
+  # per replica. Reuses the same resolver train_rl.py uses for the production rollout
+  # path, so validate_converter.py's parallelism math stays consistent with it.
+  rollout_kwargs = get_rollout_kwargs_for_parallelism(sampler_config, len(sampler_devices))
   vllm_kwargs = {
       "model": getattr(trainer_config, "vllm_model_path", None) or vllm_model_name_mapping[trainer_config.model_name],
       "max_model_len": trainer_config.max_target_length,
       "load_format": vllm_load_format,
-      "data_parallel_size": dp_size,
-      "tensor_parallel_size": sampler_config.rollout_tensor_parallelism,
+      "data_parallel_size": rollout_kwargs["data_parallel_size"],
+      "tensor_parallel_size": rollout_kwargs["tensor_parallel_size"],
       "gpu_memory_utilization": getattr(trainer_config, "hbm_utilization_vllm", 0.85),
       "num_gpu_blocks_override": 512,
       "async_scheduling": getattr(sampler_config, "async_scheduling", False),
@@ -706,13 +704,16 @@ def validate_converter(argv) -> None:
         additional_config.update(ast.literal_eval(vconfig))
     else:
       additional_config.update(vconfig)
+  sharding_strategy_updates = {}
+  if rollout_kwargs["expert_parallel_size"] > 1:
+    sharding_strategy_updates["expert_parallelism"] = rollout_kwargs["expert_parallel_size"]
   if multislice:
     # Pin vLLM to its assigned sampler devices so it doesn't overlap with trainer.
-    additional_config["sharding"] = {
-        "sharding_strategy": {
-            "device_indexes": [d.id for d in sampler_devices],
-        }
-    }
+    sharding_strategy_updates["device_indexes"] = [d.id for d in sampler_devices]
+  if sharding_strategy_updates:
+    additional_config.setdefault("sharding", {}).setdefault("sharding_strategy", {}).update(
+        sharding_strategy_updates
+    )
 
   if additional_config:
     vllm_kwargs["additional_config"] = additional_config
@@ -740,8 +741,9 @@ def validate_converter(argv) -> None:
       converter = Qwen35MaxTextToVLLMConverter(trainer_config, mesh)
     else:
       converter = Qwen3MaxTextToVLLMConverter(trainer_config, mesh)
-    with timer("Overall Conversion"):
+    with _SyncPhase("StandaloneConverter.convert (conversion only)") as phase:
       maxtext_vllm_state = converter.convert(model_state)
+      phase.block_on(maxtext_vllm_state)
     del model_state, model, mesh, converter
   elif force_maxtext and not use_weight_converter:
     # Legacy Direct Sync path: transfer_state_directly from tunix
@@ -770,7 +772,7 @@ def validate_converter(argv) -> None:
         model_name=trainer_config.model_name,
         direct=force_maxtext,
         config=trainer_config,
-        tp=sampler_config.rollout_tensor_parallelism,
+        tp=rollout_kwargs["tensor_parallel_size"],
     )
     with _SyncPhase("WeightConverter.convert (conversion only)") as phase:
       maxtext_vllm_state = converter.convert(model_state, target_state=golden_llm_state)
