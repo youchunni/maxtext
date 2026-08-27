@@ -392,6 +392,20 @@ class ReshapeForcedRoutedExpertsForScanTest(unittest.TestCase):
       cycle_idx, sub_idx = divmod(moe_layer, moe_per_cycle)
       self.assertTrue((scanned[cycle_idx, sub_idx] == moe_layer).all())
 
+  def test_rejects_unexpected_ndim(self):
+    """Only 3D ([batch, seq, top_k]) or 4D ([batch, seq, num_moe_layers,
+    top_k]) forced_routed_experts are valid; anything else (a caller bug,
+    e.g. an unbatched or over-batched array) must raise, not silently
+    misroute or crash deeper in the stack."""
+    for bad_shape in ((4,), (2, 4), (2, 4, 8, 2, 1)):  # ndim 1, 2, 5
+      with self.assertRaises(ValueError):
+        reshape_forced_routed_experts_for_scan(
+            jnp.zeros(bad_shape, dtype=jnp.int32),
+            num_moe_layers=4,
+            scan_length=1,
+            moe_per_cycle=4,
+        )
+
 
 class TrainerRouterReplayTest(unittest.TestCase):
   """Integration tests: forced routing threaded end-to-end through

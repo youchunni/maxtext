@@ -1281,6 +1281,12 @@ class Decoder(nn.Module):
               is_moe = llama4.determine_is_moe_layer(lyr, self.config.interleave_moe_layer_step)
 
             if is_moe and forced_routed_experts is not None:
+              if forced_routed_experts.ndim not in (3, 4):
+                raise ValueError(
+                    "forced_routed_experts must be [batch, seq, top_k] (3D, broadcast to every "
+                    "MoE layer) or [batch, seq, num_moe_layers, top_k] (4D, per-layer); got ndim="
+                    f"{forced_routed_experts.ndim} with shape {forced_routed_experts.shape}."
+                )
               if forced_routed_experts.ndim == 4:
                 current_forced_routed_experts = forced_routed_experts[:, :, moe_lyr_idx, :]
               else:

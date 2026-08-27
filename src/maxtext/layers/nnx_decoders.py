@@ -260,6 +260,12 @@ def reshape_forced_routed_experts_for_scan(
     Array shaped `[scan_length, moe_per_cycle, batch, seq, top_k]`.
   """
   fre = forced_routed_experts
+  if fre.ndim not in (3, 4):
+    raise ValueError(
+        "forced_routed_experts must be [batch, seq, top_k] (3D, broadcast to every MoE layer) "
+        f"or [batch, seq, num_moe_layers, top_k] (4D, per-layer); got ndim={fre.ndim} with shape "
+        f"{fre.shape}."
+    )
   if fre.ndim == 4:
     # [batch, seq, num_moe_layers, top_k] -> [num_moe_layers, batch, seq, top_k]
     fre = jnp.moveaxis(fre, 2, 0)
@@ -2103,6 +2109,12 @@ class NNXDecoder(nnx.Module):
 
           if is_moe and "forced_routed_experts" in current_kwargs and current_kwargs["forced_routed_experts"] is not None:
             routed_experts = current_kwargs["forced_routed_experts"]
+            if routed_experts.ndim not in (3, 4):
+              raise ValueError(
+                  "forced_routed_experts must be [batch, seq, top_k] (3D, broadcast to every "
+                  "MoE layer) or [batch, seq, num_moe_layers, top_k] (4D, per-layer); got ndim="
+                  f"{routed_experts.ndim} with shape {routed_experts.shape}."
+              )
             if routed_experts.ndim == 4:
               current_kwargs["forced_routed_experts"] = routed_experts[:, :, moe_lyr_idx, :]
             else:
